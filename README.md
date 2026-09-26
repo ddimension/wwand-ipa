@@ -87,6 +87,31 @@ forces it.
 
 ## Setup
 
+**With a bundle from the eIM** (`eim-ipad-provision/1`, `eimctl ipad bundle`,
+eIM decision D-69): one file with the eIM configuration and a device key the
+eIM issued. The card's EID need not be known; the card registers itself.
+
+```
+wwandctl ipa [modem] provision /tmp/bundle.json
+```
+
+- ipad stores the configuration on the card (or in the emulation), puts the
+  key in `/etc/wwand/ipa/device.key` (0600) and **deletes the file**. The
+  bundle is a secret — it holds the private key in clear —, so copy it to
+  the router over SSH only. A bundle that could not be stored (expired, the
+  card already has an eIM) is left where it is, and the command says so.
+- Fleet management is switched on (`option ipa '1'`).
+- The next poll **binds** the card first: ipad posts the card's
+  `eim-euicc-import/1` file, signed with the bundle key, to
+  `/ipad/v1/bind` on the eIM, over the same TLS as ESipa, and only then asks
+  for packages. 204 or 409 (already registered): bound. 403: refused — the
+  card is not polled again until an operator acts (`reset`, a new bundle).
+  429, 5xx or no answer: tried again at the next poll.
+- An IoT eUICC takes only the configuration; it signs with its own
+  certificate and does not bind.
+
+**Without a bundle:**
+
 1. **Point the modem at the eIM.** The eIM operator provides the eIM
    configuration: an `AddInitialEimRequest` as `eimctl eim-config` writes it
    (tag `BF57`). A `GetEimConfigurationDataResponse` (`BF55`) or a single
@@ -158,17 +183,54 @@ ipad logs to the syslog itself (`logread -e ipad`).
 **CLI:**
 
 ```
-wwandctl ipa [modem]                   # state, the card, the last run
-wwandctl ipa [modem] poll              # poll now
-wwandctl ipa [modem] eim <file>        # set the eIM, enable
-wwandctl ipa [modem] export <file>     # the eIM import file (emulated card)
+wwandctl ipa [modem]                    # state, the card, the last run
+wwandctl ipa [modem] poll [--timeout S] # poll now and wait for the end (JSON)
+wwandctl ipa [modem] poll --no-wait     # only start it
+wwandctl ipa [modem] eim <file>         # set the eIM, enable
+wwandctl ipa [modem] export <file>      # the eIM import file (emulated card)
+wwandctl ipa [modem] provision <bundle> # store a bundle, enable (JSON)
+wwandctl ipa [modem] info               # the card now (JSON)
+wwandctl ipa [modem] reset              # forget configuration, state, key (JSON)
 ```
+
+`provision`, `poll`, `info` and `reset` are for scripts too (the eIM lab's
+target driver, a bulk station): the last line on stdout is one JSON object,
+messages for people go to stderr, and the exit status is
+
+| Exit | |
+|---|---|
+| 0 | done (`poll`: the run completed, the eIM had no more packages) |
+| 1 | failed: the eIM or the network, the card, an argument; `error` says which |
+| 2 | the eIM refused to bind the card (403) |
+| 3 | not supported here: ipad or wwand-esim not installed |
+
+- `poll` waits for a run already under way (a scheduled one) to end, then
+  runs its own, at most `--timeout` seconds (default 300) in all:
+  `{"result":"ok"|"error","packages":n,"results":n,"notifications":n,"bound":bool,"bind":"…","eid":"…","error":"…"}`.
+  `results` counts the results the eIM acknowledged.
+- `info` reads the card (a short session of its own):
+  `{"eid","card_type":"iot"|"emulated","bound","bind","counter","key_fingerprint","last_poll","last_error"}`.
+  `bind` is `none`, `pending`, `done` or `refused`; `bound` is null for an
+  IoT eUICC, which does not bind. `last_poll` is the time of the last poll.
+- `provision` answers like `info`, plus `bundle_deleted`, or with
+  `bundle_kept` when the bundle could not be stored.
+- `reset` removes the eIM configuration of the emulation, its state, the
+  device key and the binding (`ipad reset`, no card needed), refused while a
+  run is under way. The uci options stay: with `option ipa` on, polls then
+  fail (`no_eim_config`) until a new bundle is provisioned. An IoT eUICC keeps
+  its eIM configuration; only the eIM can remove it.
 
 **ubus:** `modem_plugin { modem, plugin: "ipa", op }`, with these ops:
 
 - `status`;
 - `poll`: returns once the run has started; the outcome shows in `status`;
-- `export { file }`: answers `{ file }` when the file is written.
+- `export { file }`: answers `{ file }` when the file is written;
+- `provision { file }`: answers the card's info once the bundle is stored;
+- `info`: the card's info, read in a session of its own;
+- `reset`: `{ reset: true }`.
+
+Only a poll moves the schedule; `export`, `provision` and `info` do not count
+as runs.
 
 The read-only `modem_plugin_status` reaches `status` only.
 
@@ -179,8 +241,10 @@ The read-only `modem_plugin_status` reaches `status` only.
 | `enabled`, `state` | `idle` / `running` / `waiting_online` / `downloading` |
 | `eid`, `backend` | `iot` / `emulated` |
 | `key_fingerprint` | SHA-256 of the device key |
+| `bind`, `counter` | an emulated card's self-binding (`none` / `pending` / `done` / `refused`) and its counter for the eIM |
+| `last_poll` | `{ at, ok, error, summary }`: the last poll, with ipad's own account of it (packages, acknowledged results, exit code) |
 | `runs`, `profile_changes` | counters |
-| `last_start`, `last_end`, `last_ok`, `last_error` | the last run. Errors: `no_eim_config`, `eim_config_missing`, `busy`, `exit <n>`, … |
+| `last_start`, `last_end`, `last_ok`, `last_error` | the last run. Errors: ipad's own reason, or `no_eim_config`, `eim_config_missing`, `busy`, `exit <n>`, … |
 | `fails` | consecutive failed runs |
 | `next_due`, `interval` | the schedule |
 | `last_changes` | switches, installs, deletions and downloads |

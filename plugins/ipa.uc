@@ -24,7 +24,9 @@
 // emulating the SGP.32 functions: then the eIM configuration and the replay
 // counters live in its state directory (/etc/wwand/ipa, kept across upgrades),
 // and results are signed with a device key there, which the eIM learns from
-// `wwandctl ipa export`. Such a card has no connectivity parameters, so its
+// `wwandctl ipa export` — or issued itself, in a provisioning bundle
+// (`wwandctl ipa provision`, eIM decision D-69), with which the card binds
+// itself at the eIM on its first poll. Such a card has no connectivity parameters, so its
 // wwand_sim section is created empty, for the user to fill in.
 //
 // Exportless plain script: require() returns the API — the plugin object wwand
@@ -239,6 +241,8 @@ return {
 		let timing = { ...TIMING, ...(deps.timing ?? {}) };
 		let now = deps.now ?? (() => time());
 		let exists = deps.exists ?? ((p) => fs.access(p) == true);
+		// `ipad reset` needs no card, so no bridge session: a plain process
+		let reset_run = deps.reset_run ?? ((cmd) => system(cmd));
 		let states = {};
 
 		let state_of = (ref) => {
@@ -270,16 +274,28 @@ return {
 		let finish = (ref, st, ok, error, cb, result) => {
 			st.seq++;   // anything still pending from this run is stale now
 			st.state = 'idle';
-			st.last_end = now();
-			st.last_ok = ok;
-			st.last_error = ok ? null : error;
-			st.fails = ok ? 0 : (st.fails ?? 0) + 1;
-			st.runs++;
+
+			// the assistant's own word on why it failed (its summary event),
+			// rather than an exit status
+			if (!ok && st.summary?.error)
+				error = st.summary.error;
+
+			// Only a poll moves the schedule: an `info`, `provision` or
+			// `export` asked for by hand must neither count as the poll that
+			// was due nor, failing, push the next one back.
+			if (st.job == null) {
+				st.last_end = now();
+				st.last_ok = ok;
+				st.last_error = ok ? null : error;
+				st.fails = ok ? 0 : (st.fails ?? 0) + 1;
+				st.runs++;
+				st.last_poll = { at: st.last_end, ok: ok, error: ok ? null : error, summary: st.summary };
+			}
 
 			if (ok)
 				log('info', sprintf('modem %s: ipa: %s done', ref, st.why ?? 'poll'));
 			else
-				log('warn', sprintf('modem %s: ipa: run failed (%s)', ref, error ?? '?'));
+				log('warn', sprintf('modem %s: ipa: %s failed (%s)', ref, (st.job == null) ? 'run' : st.why, error ?? '?'));
 
 			// The assistant may have installed, deleted or switched profiles
 			// without the host seeing which, so the card's list in status is
@@ -316,8 +332,9 @@ return {
 
 			st.last_changes = st.changes;
 			st.reached_card = false;
+			st.job = null;
 
-			cb?.(ok ? null : { error: 'ipa', detail: error }, result ?? null);
+			cb?.(ok ? null : { error: 'ipa', detail: error, code: st.summary?.code }, result ?? null);
 		};
 
 		// A profile change inside the run: reset the SIM so the modem takes the
@@ -489,6 +506,17 @@ return {
 				st.eid = rec.payload?.eid;
 				st.backend = rec.payload?.backend;
 				st.key_fingerprint = rec.payload?.key_fingerprint;
+				// an emulated card's self-binding (D-69) and its counter
+				st.bind = rec.payload?.bind;
+				st.counter = rec.payload?.counter;
+				return reply({});
+			// the end of a poll or provision: what it did, and why it failed
+			case 'summary':
+				st.summary = rec.payload;
+
+				if (rec.payload?.bind != null)
+					st.bind = rec.payload.bind;
+
 				return reply({});
 			case 'profile_changed':
 				return on_profile_changed(ref, st, slot, reply);
@@ -502,7 +530,8 @@ return {
 			reply({ online: false });
 		};
 
-		// job: null for a poll, { cmd: 'export', file } for an export
+		// job: null for a poll, { cmd: 'export'|'provision'|'info', file? }
+		// for a run of its own; job.result(st) is what its callback answers
 		let run = (ref, cfg, why, cb, job) => {
 			let entry = deps.modem_of(ref);
 			let st = state_of(ref);
@@ -530,6 +559,8 @@ return {
 			st.state = 'running';
 			st.last_start = now();
 			st.why = why;
+			st.job = job;
+			st.summary = null;
 			st.slot = slot;
 			st.reached_card = false;
 			st.iccid_at_start = entry.modem.info?.iccid;
@@ -587,7 +618,7 @@ return {
 								return step('poll');
 							}
 
-							finish(ref, st, true, null, cb, job ? { file: job.file } : null);
+							finish(ref, st, true, null, cb, job?.result ? job.result(st) : job ? { file: job.file } : null);
 						});
 
 					if (r) {
@@ -599,6 +630,22 @@ return {
 				step('poll');
 			});
 		};
+
+		// What `wwandctl ipa info` prints: the card as the assistant last
+		// described it. `bound` is the self-binding's (D-69) and only an
+		// emulated card has one; for an IoT eUICC the IPA cannot know
+		// whether the eIM has it registered, so null.
+		let info_of = (st) => ({
+			eid: st.eid,
+			card_type: st.backend,
+			bind: st.bind,
+			bound: (st.backend == 'emulated') ? (st.bind == 'done') : null,
+			counter: st.counter,
+			key_fingerprint: st.key_fingerprint,
+			last_poll: st.last_poll?.at,
+			last_ok: st.last_poll?.ok,
+			last_error: st.last_poll?.error,
+		});
 
 		return {
 			// called from the daemon's 10 s status tick for every modem
@@ -656,6 +703,52 @@ return {
 				run(ref, cfg, 'export', cb, { cmd: 'export', file: file });
 			},
 
+			// A provisioning bundle (eIM decision D-69) or an eIM
+			// configuration, stored by the assistant (`ipad provision`),
+			// which deletes a bundle once it holds its key: the file carries
+			// an unencrypted private key. The card binds itself on its next
+			// poll. Answers the card's info.
+			provision: function(ref, cfg, file, cb) {
+				if (!safe_path(file))
+					return cb({ error: 'invalid_argument', detail: 'file' });
+
+				run(ref, cfg, 'provision', cb, { cmd: 'provision', file: file,
+					result: (st) => ({ ...info_of(st), file: file }) });
+			},
+
+			// the card as the assistant sees it now (`ipad info`): EID,
+			// backend, device key, binding and counter
+			info: function(ref, cfg, cb) {
+				run(ref, cfg, 'info', cb, { cmd: 'info', result: info_of });
+			},
+
+			// Forget the eIM configuration, the emulation state, the device
+			// key and the binding (`ipad reset`, no card needed), so that a
+			// fresh bundle starts from nothing. An IoT eUICC keeps its eIM
+			// configuration on the card: removing that is the eIM's eCO.
+			// Refused while a run holds the state.
+			reset: function(ref, cfg, cb) {
+				let st = state_of(ref);
+
+				if (st.state != 'idle')
+					return cb({ error: 'busy' });
+
+				if (!exists(ipad))
+					return cb({ error: 'ipa_not_installed', detail: sprintf('%s is missing (package wwand-ipad)', ipad) });
+
+				let rc = reset_run(sprintf("%s -s '%s' reset >/dev/null 2>&1", ipad, dir));
+
+				if (rc != 0)
+					return cb({ error: 'ipa', detail: sprintf('reset: exit %s', rc) });
+
+				// what this module knew of the card is gone with it; the
+				// schedule (online since, spread) is the modem's and stays
+				states[ref] = { state: 'idle', seq: st.seq + 1, runs: 0, profile_changes: 0,
+				                online_since: st.online_since, spread: st.spread };
+				log('notice', sprintf('modem %s: ipa: reset — eIM configuration, state and device key forgotten', ref));
+				cb(null, { reset: true });
+			},
+
 			status: function(ref, cfg) {
 				let st = state_of(ref);
 
@@ -685,6 +778,13 @@ return {
 					// the device key the eIM must have imported
 					backend: st.backend,
 					key_fingerprint: st.key_fingerprint,
+					// an emulated card's self-binding (D-69): none, pending,
+					// done or refused; and its counter for the eIM
+					bind: st.bind,
+					counter: st.counter,
+					// the last poll's own account (the assistant's summary
+					// event): packages, acknowledged results, bind, error
+					last_poll: st.last_poll,
 					// the last connectivity report and what became of it
 					connectivity: st.connectivity,
 				};
@@ -751,6 +851,13 @@ return {
 				// modem_plugin { op: 'export', args: { file } } -> { file }
 				export: (ref, ext, args, cb) =>
 					sch.export(ref, cfg_of(ext, pd.modem_of(ref)), args?.file ?? '/tmp/wwand/ipa-export.json', cb),
+				// modem_plugin { op: 'provision', args: { file } } -> the card's info
+				provision: (ref, ext, args, cb) =>
+					sch.provision(ref, cfg_of(ext, pd.modem_of(ref)), args?.file ?? '', cb),
+				// modem_plugin { op: 'info' } -> { eid, card_type, bound, counter, … }
+				info: (ref, ext, args, cb) => sch.info(ref, cfg_of(ext, pd.modem_of(ref)), cb),
+				// modem_plugin { op: 'reset' } -> { reset: true }
+				reset: (ref, ext, args, cb) => sch.reset(ref, cfg_of(ext, pd.modem_of(ref)), cb),
 			},
 			read_ops: [ 'status' ],
 		};

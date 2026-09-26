@@ -447,6 +447,82 @@ delete modem.slot_status;
 	script = null;
 }
 
+// --- the bundle (eIM decision D-69): provision, info, reset, the summary ------
+
+{
+	let resets_run = [];
+	let s3 = mk({ reset_run: (cmd) => { push(resets_run, cmd); return 0; } });
+	let ev = (evs, code) => (on_ipa, on_done) => {
+		let i = 0, next;
+
+		next = () => (i < length(evs))
+			? on_ipa({ kind: 'event', event: evs[i][0], payload: evs[i++][1] }, next)
+			: on_done(code ? { error: 'lpac', code: code } : null, '');
+		next();
+		return null;
+	};
+	let info_ev = [ 'info', { eid: EID, backend: 'emulated', key_fingerprint: 'AB12', bind: 'pending', counter: 0 } ];
+
+	provisioned = true;
+	online = 'wan:50';
+
+	// provision: its own run with the file; answers the card's info
+	runs = [];
+	script = ev([ info_ev, [ 'summary', { command: 'provision', code: 0, bind: 'pending' } ] ]);
+	let before = s3.status('m1', cfg);
+	let pres = null;
+	s3.provision('m1', cfg, '/tmp/b.json', (e, r) => { pres = [ e, r ]; });
+	ok(index(runs[0] ?? '', " provision '/tmp/b.json'") >= 0, 'bundle: ipad provision with the file');
+	eq(pres, [ null, { eid: EID, card_type: 'emulated', bind: 'pending', bound: false, counter: 0, key_fingerprint: 'AB12',
+	                   last_poll: null, last_ok: null, last_error: null, file: '/tmp/b.json' } ],
+		'bundle: provision answers the card, binding pending');
+	eq([ s3.status('m1', cfg).runs, s3.status('m1', cfg).last_end ], [ before.runs, before.last_end ],
+		'bundle: a provision is no poll: the schedule does not move');
+	s3.provision('m1', cfg, "/tmp/b'.json", (e, r) => { pres = [ e, r ]; });
+	eq(pres[0]?.error, 'invalid_argument', 'bundle: a path with shell characters is refused');
+
+	// a poll: the summary event is the run's account, the bind state follows it
+	script = ev([ info_ev, [ 'summary', { command: 'poll', code: 0, packages: 1, acknowledged: 1, bind: 'done' } ] ]);
+	s3.poll('m1', cfg, () => null);
+	let st = s3.status('m1', cfg);
+	eq([ st.bind, st.last_poll.ok, st.last_poll.summary.packages ], [ 'done', true, 1 ], 'bundle: poll: bound, the summary kept');
+
+	// refused (ipad exit 4): the assistant's reason, not "exit 4"
+	script = ev([ info_ev, [ 'summary', { command: 'poll', code: 4, bind: 'refused',
+		error: 'the eIM refused the binding (403): not polling until an operator acts' } ] ], 4);
+	s3.poll('m1', cfg, () => null);
+	st = s3.status('m1', cfg);
+	eq([ st.bind, st.last_poll.ok, st.last_poll.summary.code ], [ 'refused', false, 4 ], 'bundle: poll refused: code 4 kept');
+	ok(index(st.last_error, '403') >= 0, 'bundle: poll refused: the assistant\'s reason is the error');
+
+	// info: a run of its own, not a poll
+	let before_runs = st.runs;
+	script = ev([ [ 'info', { eid: EID, backend: 'emulated', key_fingerprint: 'AB12', bind: 'refused', counter: 0 } ] ]);
+	let ires = null;
+	s3.info('m1', cfg, (e, r) => { ires = [ e, r ]; });
+	eq(ires[1]?.bound, false, 'bundle: info: not bound');
+	eq(ires[1]?.bind, 'refused', 'bundle: info: refused');
+	ok(index(ires[1]?.last_error ?? '', '403') >= 0, 'bundle: info: the last poll\'s error');
+	eq(s3.status('m1', cfg).runs, before_runs, 'bundle: info is no poll either');
+
+	// reset: without a card session, forgets what the plugin knew of the card
+	runs = [];
+	let rr = null;
+	s3.reset('m1', cfg, (e, r) => { rr = [ e, r ]; });
+	eq(rr, [ null, { reset: true } ], 'bundle: reset done');
+	eq(resets_run, [ "/x/ipad -s '/s' reset >/dev/null 2>&1" ], 'bundle: reset runs ipad reset on the state directory');
+	eq(length(runs), 0, 'bundle: reset needs no card session');
+	st = s3.status('m1', cfg);
+	eq([ st.eid, st.bind, st.key_fingerprint, st.last_poll ], [ null, null, null, null ], 'bundle: reset: the card is forgotten');
+
+	// reset while a run holds the state: refused
+	script = (on_ipa, on_done) => { on_ipa({ kind: 'event', event: 'info', payload: {} }, () => null); return null; };
+	s3.poll('m1', cfg, () => null);
+	s3.reset('m1', cfg, (e, r) => { rr = [ e, r ]; });
+	eq(rr[0]?.error, 'busy', 'bundle: no reset under a running assistant');
+	script = null;
+}
+
 // --- the real bridge: the assistant's log reaches the syslog, not a file ------
 
 import * as fs from 'fs';
