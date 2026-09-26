@@ -1,12 +1,12 @@
 # wwand-ipa
 
 eSIM fleet management for [wwand](https://github.com/ddimension/wwand), the
-OpenWrt cellular connection manager: the router becomes the SGP.32 IoT
-Profile Assistant for an eIM.
+OpenWrt cellular connection manager. With it, the router acts as the GSMA
+SGP.32 IoT Profile Assistant for an eIM.
 
-This is a **wwand plugin**, not part of wwand itself: it hooks into the daemon
-through wwand's plugin interface (`plugins.uc`, see wwand's `docs/reference.md`,
-"Plugins") and is packaged separately by the ddimension OpenWrt feed.
+This is a **wwand plugin**, not part of wwand itself. It hooks into the daemon
+through wwand's plugin interface (`plugins.uc`, see "Plugins" in wwand's
+`docs/reference.md`), and the ddimension OpenWrt feed packages it separately.
 
 | Path | Installed as | Package |
 |---|---|---|
@@ -14,114 +14,177 @@ through wwand's plugin interface (`plugins.uc`, see wwand's `docs/reference.md`,
 | `ctl/ipa.uc` | `/usr/share/ucode/wwand/ctl/ipa.uc` (`wwandctl ipa`) | `wwand-ipa` |
 | `luci/` | the *Network → eSIM Fleet* page | `luci-app-wwand-ipa` |
 
-The assistant itself is [onomondo-ipa](https://github.com/onomondo/onomondo-ipa)
-(AGPL-3.0), built by the feed as `wwand-ipad` with a patch that gives it a
-card backend speaking lpac's stdio APDU protocol (so wwand relays its APDUs
-over the modem's own channel) and a `-H` mode that hands profile changes to
-wwand. The patch lives in the feed, `wwand-ipad/patches/`.
-
-## Using it
-
-An **eIM** is the fleet side of GSMA SGP.32: the operator queues eUICC packages
-(download a profile, enable, disable, delete) and an **IoT Profile Assistant**
-on the device fetches and runs them. `wwand-ipa` provides that assistant:
-[onomondo-ipa](https://github.com/onomondo/onomondo-ipa) (AGPL, packaged as
-`wwand-ipad`, `/usr/lib/wwand/ipad`), built with a card backend that speaks
-lpac's stdio protocol, so its APDUs go over the modem's own channel through the
+The assistant itself is [ipad](https://github.com/ddimension/ipad), a C
+implementation of SGP.32 v1.3 that the feed builds as `wwand-ipad`
+(`/usr/lib/wwand/ipad`). It reaches the card through lpac's stdio APDU
+protocol, so wwand relays its APDUs over the modem's own channel through the
 same bridge lpac uses. It needs `wwand-esim`.
 
-What to know before using it:
+## What it does
 
-- **It drives an SGP.22 consumer eUICC**, the cards `wwand-esim` already
-  manages, through the assistant's *IoT eUICC emulation*. onomondo-ipa
-  implements SGP.32 **v1.0** (onomondo-ipa README, commit 6aaeb38, 2026-09-01);
-  in emulation it signs its results with a placeholder, so **the eIM must
-  accept emulation-mode results**. A production eIM for accredited SGP.32 v1.2
-  IoT eUICCs does not.
-- **The eIM trust lives on the router, not on the card.** In emulation the eIM
-  configuration and its replay counter are kept in the assistant's state file,
-  `/etc/wwand/ipa/<EID>.nvstate` — one per card. The directory is kept across
-  a sysupgrade (`/lib/upgrade/keep.d/wwand-ipa`), so it is the natural place
-  for the eIM configuration file too. TLS to
-  the eIM is the only authentication of the commands; `ipa_insecure` removes
-  even that and is for lab eIMs only.
-- **Manual profile changes are locked on a managed card.** With `option ipa`
-  set, `modem_esim` refuses `download`, `enable`, `disable`, `delete` and
-  `notify` with `esim_managed` (status says `esim_managed_by: "ipa"`): the assistant keeps the card's state (the profile
-  to roll back to, pending results) in its state file, and a change made past it
-  puts the two out of step. Pending notifications belong to the eIM too. Pass
-  `"force": true` to override.
+An **eIM** is the fleet side of SGP.32. The operator queues eUICC packages
+(download a profile, enable, disable, delete), and the assistant on the device
+fetches and runs them. What the host adds:
 
-**Setup.** Put the eIM configuration (a BER-encoded `AddInitialEimRequest`, as
-the eIM operator provides it) on the router and point the modem at it:
+- **Profile changes reach the modem.** When a package switches the active
+  profile, wwand resets the SIM so the modem takes the new profile. This is the
+  same apply as a manual `enable`; where the SIM cannot be power-cycled, wwand
+  resets the modem instead. wwand then waits up to 5 minutes for a *new* data
+  session. If none comes, the assistant rolls the change back (SGP.32 3.3.2)
+  and reports that instead, and wwand applies the rollback the same way.
+- **Direct downloads run through lpac** (SGP.32 3.2.3.1), under the
+  assistant's own claim on the card. The assistant reports the result to the
+  eIM. Indirect downloads (through the eIM) the assistant does itself.
+- **The APN of the enabled profile lands in the config.** After every run, the
+  assistant reads the enabled profile's connectivity parameters (SGP.32
+  5.9.24). wwand writes them into a `wwand_sim` section for that ICCID,
+  `wwsim_<iccid>`, marked `option origin 'ipa'`:
 
-```
-config wwand_modem 'm0'
-	...
-	option ipa '1'
-	option ipa_eim_config '/etc/wwand/ipa/eim.ber'
-```
+  ```
+  config wwand_sim 'wwsim_89000123456789012342'
+  	option iccid '89000123456789012342'
+  	option origin 'ipa'
+  	option apn 'iot.example'
+  	option pdp_type 'ipv4v6'
+  ```
 
-Or in one step, which copies the file to `/etc/wwand/ipa/<modem>-eim.ber`,
-sets both options and reloads (after checking the file is a BER
-`AddInitialEimRequest`, tag `BF57`, or `GetEimConfigurationDataResponse`,
-`BF55`):
+  - **A hand-written `wwand_sim` for the same card always wins.** It is never
+    touched.
+  - **Taking the section over:** delete its `origin` line.
+  - **A card that states no parameters still gets its section.** That is
+    always the case for an emulated SGP.22 card (below). The section is
+    created with just the ICCID, for you to fill in, and later runs leave it
+    as it is.
 
-```
-wwandctl ipa [modem] eim /tmp/eim.ber
-```
+## Cards
+
+ipad works with two kinds of card:
+
+- **An IoT eUICC** (SGP.32) stores the eIM configuration itself and signs
+  its own results.
+- **An ordinary SGP.22 consumer eUICC**, the cards `wwand-esim` already
+  manages. ipad *emulates* the SGP.32 functions: the eIM configuration, the
+  replay counters and the stored results live in
+  `/etc/wwand/ipa/<EID>.state`. Results are signed with a **device key**,
+  `/etc/wwand/ipa/device.key`.
+  - The directory is kept across a sysupgrade
+    (`/lib/upgrade/keep.d/wwand-ipa`).
+  - The eIM verifies these signatures once it has imported the key:
+
+    ```
+    wwandctl ipa [modem] export /tmp/device.json     # on the router
+    eimctl euicc import device.json                  # on the eIM
+    ```
+
+  - The import file (`eim-euicc-import/1`) proves that its maker holds the
+    key.
+  - A key file that exists but cannot be read is never replaced. If the file
+    is gone, ipad creates a new key, and the eIM rejects its results until
+    that key is imported.
+
+ipad probes which kind it is talking to; `option ipa_backend 'iot'|'emu'`
+forces it.
+
+## Setup
+
+1. **Point the modem at the eIM.** The eIM operator provides the eIM
+   configuration: an `AddInitialEimRequest` as `eimctl eim-config` writes it
+   (tag `BF57`). A `GetEimConfigurationDataResponse` (`BF55`) or a single
+   `EimConfigurationData` (`30`) works too.
+
+   ```
+   config wwand_modem 'm0'
+   	...
+   	option ipa '1'
+   	option ipa_eim_config '/etc/wwand/ipa/eim.ber'
+   ```
+
+   Or in one step, which checks the file and copies it to
+   `/etc/wwand/ipa/<modem>-eim.ber`, sets both options and reloads:
+
+   ```
+   wwandctl ipa [modem] eim /tmp/eim.ber
+   ```
+
+2. **For an SGP.22 card, import its device key on the eIM** (`export`, above).
+   The first run creates the key; `export` does too, if it runs first.
 
 Changing these options does not restart the modem. The configuration reaches
-a card only the first time it is seen, when it has no state file yet. A card
-that already has one keeps its eIM, and `wwandctl` says so; the eIM itself
-can move a card to another eIM (SGP.32 `addEim` / `updateEim`).
+a card only when the card has no eIM yet: ipad says so on its first poll,
+and wwand then provisions it. A card that has an eIM keeps it. Moving a card
+to another eIM is the eIM's business (SGP.32 `addEim` / `updateEim`).
 
-**What happens.** Once the modem's connection has been up for a minute plus up
-to five more, and every `ipa_interval` seconds (default 3600) plus up to a
-tenth more after that, wwand reads the card's EID and runs the assistant. The
-extra is fixed per router (derived from its IMEI), so a fleet that comes back
-from one power cut does not reach the eIM in the same second, and stays spread
-out afterwards. After a failed run the retry comes after 600 s, doubling with
-every further failure up to the interval.
+## Options
 
-1. A card seen for the first time (no state file) is **provisioned**: the eIM
-   configuration from `ipa_eim_config` is stored for it. Without that option the
-   run stops with `no_eim_config`. Nothing is guessed.
-2. The eIM is **polled** and every queued package is run.
-3. When a package **changes the active profile**, the assistant hands it to
-   wwand: the SIM is reset so the modem takes the new profile (the same apply as
-   a manual `enable`; where the SIM cannot be power-cycled, wwand resets the
-   modem instead), and wwand waits up to 5 minutes for a *new* data session
-   before it lets the assistant report the result. If the eIM cannot be reached
-   over the new profile, the assistant rolls back to the previous one (when the
-   eIM allowed that), and wwand applies that change the same way.
+| Option | Default | |
+|---|---|---|
+| `ipa` | off | fleet management for this modem |
+| `ipa_eim_config` | – | the eIM configuration file for a card without an eIM |
+| `ipa_eim_id` | the first | which eIM, when the card has several |
+| `ipa_interval` | 3600 | seconds between polls (at least 300) |
+| `ipa_backend` | `auto` | `iot` / `emu` to skip the probe |
+| `ipa_direct` | on | offer direct downloads (lpac) to the eIM |
+| `ipa_insecure` | off | no TLS verification of the eIM — lab only |
 
-The card managed is the modem's active eUICC (on a dual-SIM module that can be
-the second physical slot); a modem that cannot list its slots uses
-`sim_slot`, or 1.
+The eIM's TLS identity comes from its configuration
+(`trustedPublicKeyDataTls`: a pinned key, its certificate or its CA), and
+otherwise from the system CAs.
 
-After every run that reached the card, the card's profile list in `status`
-(`esim`) is read again. The assistant may have installed, switched or deleted
-profiles.
+## Schedule
 
-The assistant's log goes to the syslog with wwand's own lines (`logread -e
-esim\[ipa\]`), at wwand's log level: its errors as warnings, the APDU traffic
-only at `debug` (`wwandctl` / ubus `set_log_level`). The run is exclusive with the
-lpac operations on the same card; one waits for the other (`busy`).
+A poll runs when all of these hold:
 
-**ubus:** `modem_plugin { modem, plugin: "ipa", op }` with op `status` or `poll`
-(run now; returns when the run started, and the outcome shows up in `status`),
-and the read-only `modem_plugin_status` for `status`.
-`status` returns `enabled`, `state` (`idle` / `running` / `waiting_online`),
-`eid`, `runs`, `profile_changes`, `last_start` / `last_end`, `last_ok`,
-`last_error` (`no_eim_config`, `eim_config_missing`, `no_eid`, `busy`,
-`exit <n>`, …), `fails` (consecutive failed runs), `next_due`, `interval` and `nvstate` (whether the card has
-state).
+- the connection has been up for a minute, plus up to five more;
+- after that, every `ipa_interval` seconds, plus up to a tenth more.
 
-`wwandctl ipa [modem] eim <file>` also refuses a file that is not a BER
-`AddInitialEimRequest` (`BF57`) or `GetEimConfigurationDataResponse` (`BF55`),
-and a modem without a `wwand_modem` section (an old-style configuration:
-migrate it first).
+The extra time is fixed per router (derived from its IMEI). A fleet that comes
+back from one power cut therefore does not reach the eIM in the same second,
+and it stays spread out afterwards. After a failed run, the next try comes
+after 600 s, doubling with each further failure up to the interval.
+
+The card managed is the modem's active eUICC. On a dual-SIM module that can be
+the second physical slot. A modem that cannot list its slots uses `sim_slot`,
+or 1.
+
+The run is exclusive with the lpac operations on the same card; one waits for
+the other (`busy`). Manual profile changes on a managed card are refused with
+`esim_managed`: the assistant's state (the profile to roll back to, pending
+results) would go out of step with the card. Pass `"force": true` to override.
+
+ipad logs to the syslog itself (`logread -e ipad`).
+
+## Interfaces
+
+**CLI:**
+
+```
+wwandctl ipa [modem]                   # state, the card, the last run
+wwandctl ipa [modem] poll              # poll now
+wwandctl ipa [modem] eim <file>        # set the eIM, enable
+wwandctl ipa [modem] export <file>     # the eIM import file (emulated card)
+```
+
+**ubus:** `modem_plugin { modem, plugin: "ipa", op }`, with these ops:
+
+- `status`;
+- `poll`: returns once the run has started; the outcome shows in `status`;
+- `export { file }`: answers `{ file }` when the file is written.
+
+The read-only `modem_plugin_status` reaches `status` only.
+
+`status` returns these fields:
+
+| Field | Meaning |
+|---|---|
+| `enabled`, `state` | `idle` / `running` / `waiting_online` / `downloading` |
+| `eid`, `backend` | `iot` / `emulated` |
+| `key_fingerprint` | SHA-256 of the device key |
+| `runs`, `profile_changes` | counters |
+| `last_start`, `last_end`, `last_ok`, `last_error` | the last run. Errors: `no_eim_config`, `eim_config_missing`, `busy`, `exit <n>`, … |
+| `fails` | consecutive failed runs |
+| `next_due`, `interval` | the schedule |
+| `last_changes` | switches, installs, deletions and downloads |
+| `connectivity` | ICCID, the source (`card` / `none` / `emulated: none`), APN, PDP type, the section and whether it was written |
 
 ## Tests
 
@@ -132,10 +195,10 @@ node luci/tools/test-ipafmt.js
 ```
 
 The tests load the plugin the way the daemon does (`wwand.plugins.ipa`, next
-to wwand's own modules), including a run through wwand's real eSIM bridge with
-a stub assistant. Not verified yet: hardware with an eUICC and a real eIM.
+to wwand's own modules). They include a run through wwand's real eSIM bridge
+with a stub assistant. ipad has its own suite, including an end-to-end run
+against a real eIM. Not verified yet: router hardware with an eUICC.
 
 ## License
 
-GPL-2.0-only, as wwand. The assistant (wwand-ipad) is AGPL-3.0 and runs as a
-separate program.
+GPL-2.0-only, as wwand and ipad.

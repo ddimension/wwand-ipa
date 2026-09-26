@@ -57,9 +57,28 @@ function ipa_lines(st, now)
 	else if (st.state == 'idle')
 		push(out, [ 'next poll', 'once the connection is up' ]);
 
-	if (st.eid)
-		push(out, [ 'card', sprintf('EID %s%s', st.eid,
-			(st.nvstate === false) ? ' · no eIM configuration stored yet' : '') ]);
+	if (st.eid) {
+		let how = (st.backend == 'emulated')
+			? sprintf(' · SGP.22 card, emulated%s', st.key_fingerprint
+				? sprintf(' · device key %s…', substr(st.key_fingerprint, 0, 16)) : '')
+			: (st.backend == 'iot') ? ' · IoT eUICC' : '';
+
+		push(out, [ 'card', sprintf('EID %s%s', st.eid, how) ]);
+	}
+
+	let cn = st.connectivity;
+
+	if (cn?.iccid) {
+		let what = (cn.source == 'card')
+			? sprintf('apn %s%s', cn.apn ?? '(empty)', cn.pdp_type ? sprintf(' · %s', cn.pdp_type) : '')
+			: sprintf('none stated (%s)', cn.source ?? 'none');
+		let where = (cn.reason == 'foreign') ? sprintf('your wwand_sim %s wins, not touched', cn.section)
+			: (cn.reason == 'exists') ? sprintf('%s kept as it is', cn.section)
+			: cn.section ? sprintf('%s%s', cn.section, cn.written ? ' (written)' : '')
+			: 'not written';
+
+		push(out, [ 'connectivity', sprintf('%s: %s → %s', cn.iccid, what, where) ]);
+	}
 
 	let c = st.last_changes, parts = [];
 
@@ -78,15 +97,24 @@ function ipa_lines(st, now)
 	return out;
 }
 
-// What an eIM configuration file is, from its first two bytes: the forms the
-// assistant loads (onomondo-ipa ipad.c:224-229, commit 6aaeb38, 2026-09-01),
-// an AddInitialEimRequest (tag BF57) or a GetEimConfigurationDataResponse
-// (BF55, the same structure under another tag). Anything else — a PEM file,
-// a hex dump, a JSON export — is refused HERE, because the assistant would
-// only fail on it at the next poll, in the syslog, on a router nobody watches.
+// What an eIM configuration file is, from its first bytes: the forms ipad
+// provisions from (ipad ipa.c ipa_add_initial_eim), an AddInitialEimRequest
+// (tag BF57, what `eimctl eim-config` writes), a GetEimConfigurationDataResponse
+// (BF55, the same list under another tag) or one bare EimConfigurationData
+// (a SEQUENCE, 30). Anything else — a PEM file, a hex dump, a JSON export — is
+// refused HERE, because the assistant would only fail on it at the next poll,
+// in the syslog, on a router nobody watches.
 function eim_config_kind(data)
 {
-	if (type(data) != 'string' || length(data) < 4 || ord(data, 0) != 0xbf)
+	if (type(data) != 'string' || length(data) < 4)
+		return null;
+
+	// a SEQUENCE that starts with eimId [0]: 30 len 80 (short or long form)
+	if (ord(data, 0) == 0x30 && (ord(data, 2) == 0x80 || (ord(data, 1) == 0x81 && ord(data, 3) == 0x80) ||
+	                             (ord(data, 1) == 0x82 && ord(data, 4) == 0x80)))
+		return 'EimConfigurationData';
+
+	if (ord(data, 0) != 0xbf)
 		return null;
 
 	switch (ord(data, 1)) {
@@ -124,7 +152,7 @@ function set_eim(ctx, modem, src)
 	let kind = eim_config_kind(data);
 
 	if (!kind)
-		die(sprintf('%s is not an eIM configuration: expected BER starting BF57 (AddInitialEimRequest) or BF55 (GetEimConfigurationDataResponse)', src));
+		die(sprintf('%s is not an eIM configuration: expected DER starting BF57 (AddInitialEimRequest), BF55 (GetEimConfigurationDataResponse) or 30 (EimConfigurationData)', src));
 
 	let dst = sprintf('/etc/wwand/ipa/%s-eim.ber', modem);
 
@@ -151,18 +179,11 @@ function set_eim(ctx, modem, src)
 	ctx.call_ok('reload', {});
 	printf('modem %s: eIM configuration %s (%s), fleet management on\n', modem, dst, kind);
 
-	// The file only reaches a card with no stored state yet; say so now, not
-	// on the first poll that quietly keeps the old eIM. The EID from the eIM
-	// runs if there were any, else from the status page's eSIM read — on a
-	// first setup there have been no runs to know it from.
-	let ist = ctx.call('modem_plugin', { modem: modem, plugin: 'ipa', op: 'status' });
-	let eid = ist?.eid ?? ctx.status().modems[modem]?.esim?.eid;
-	let nv = eid ? sprintf('/etc/wwand/ipa/%s.nvstate', uc(eid)) : null;
-
-	if (nv && fs.access(nv))
-		printf('note: card %s already has an eIM configuration stored (%s); it keeps that one\n', eid, nv);
-	else if (!eid)
-		printf('note: the card\'s EID is not known yet; if it was provisioned before, it keeps its stored eIM\n');
+	// A card that already has an eIM keeps it: the file only reaches a card
+	// without one (ipad provisions on its "no eIM" exit), and changing the eIM
+	// of a card that has one is the eIM's business (its eCO packages). Said
+	// now, not left for a poll that quietly keeps the old one.
+	printf('note: the file is stored on the card at the next poll, if the card has no eIM yet; one that has keeps it\n');
 }
 
 return {
@@ -172,7 +193,8 @@ return {
 
 	help: [
 		'ipa [modem] [status|poll]             eIM fleet management: state, or poll now',
-		'ipa [modem] eim <file>                set the eIM (BER AddInitialEimRequest) and enable it',
+		'ipa [modem] eim <file>                set the eIM (DER AddInitialEimRequest) and enable it',
+		'ipa [modem] export <file>             the eIM import file of an emulated card (device key)',
 	],
 
 	run: function(ctx, args) {
@@ -202,8 +224,24 @@ return {
 			set_eim(ctx, r.modem, rest[1]);
 			break;
 
+		case 'export': {
+			let f = rest[1] ?? '';
+
+			if (!length(f))
+				die('usage: wwandctl ipa [modem] export <file>   (for eimctl euicc import)');
+
+			// the daemon writes it: a path of this shell's, made absolute
+			if (substr(f, 0, 1) != '/')
+				f = sprintf('%s/%s', fs.getcwd(), f);
+
+			let res = ctx.call_ok('modem_plugin', { modem: r.modem, plugin: 'ipa', op: 'export', args: { file: f } });
+
+			printf('%s written — import it on the eIM: eimctl euicc import %s\n', res?.file ?? f, res?.file ?? f);
+			break;
+		}
+
 		default:
-			die('usage: wwandctl ipa [modem] [status|poll|eim <file>]');
+			die('usage: wwandctl ipa [modem] [status|poll|eim <file>|export <file>]');
 		}
 	},
 };

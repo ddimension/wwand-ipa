@@ -40,8 +40,33 @@ return baseclass.extend({
 		else if (st.state == 'idle')
 			rows.push([ _('Next poll'), _('once the connection is up') ]);
 
-		if (st.eid)
-			rows.push([ _('Card'), 'EID ' + st.eid + (st.nvstate === false ? ' · ' + _('no eIM configuration stored yet') : '') ]);
+		if (st.eid) {
+			var how = '';
+
+			if (st.backend == 'emulated')
+				how = ' · ' + _('SGP.22 card, emulated') +
+					(st.key_fingerprint ? ' · ' + _('device key %s…').format(st.key_fingerprint.substr(0, 16)) : '');
+			else if (st.backend == 'iot')
+				how = ' · ' + _('IoT eUICC');
+
+			rows.push([ _('Card'), 'EID ' + st.eid + how ]);
+		}
+
+		/* where the enabled profile's APN came from and where it went: the
+		   same text as `wwandctl ipa` */
+		var cn = st.connectivity;
+
+		if (cn && cn.iccid) {
+			var what = (cn.source == 'card')
+				? _('APN %s').format(cn.apn || _('(empty)')) + (cn.pdp_type ? ' · ' + cn.pdp_type : '')
+				: _('none stated (%s)').format(cn.source || 'none');
+			var where = (cn.reason == 'foreign') ? _('your wwand_sim %s wins, not touched').format(cn.section)
+				: (cn.reason == 'exists') ? _('%s kept as it is').format(cn.section)
+				: cn.section ? cn.section + (cn.written ? ' ' + _('(written)') : '')
+				: _('not written');
+
+			rows.push([ _('Connectivity'), '%s: %s → %s'.format(cn.iccid, what, where) ]);
+		}
 
 		var c = st.last_changes || {}, parts = [];
 
@@ -50,6 +75,7 @@ return baseclass.extend({
 		});
 		(c.installed || []).forEach(function(i) { parts.push(_('installed %s').format(i)); });
 		(c.deleted || []).forEach(function(i) { parts.push(_('deleted %s').format(i)); });
+		(c.downloads || []).forEach(function(d) { parts.push(d.ok ? _('downloaded') : _('download failed')); });
 
 		if (parts.length)
 			rows.push([ _('Last changes'), parts.join(' · ') ]);

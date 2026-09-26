@@ -14,9 +14,10 @@ let ipa = require('wwand.plugins.ipa');
 
 // --- pure helpers -------------------------------------------------------------
 
-eq(ipa.tac_of('351234567890123'), '35123456', 'tac: first 8 digits of the IMEI');
-eq(ipa.tac_of('35123'), null, 'tac: a short IMEI gives no TAC');
-eq(ipa.tac_of(null), null, 'tac: no IMEI, no TAC');
+eq(ipa.imei_of('351234567890123'), '351234567890123', 'imei: a well-formed IMEI is passed on');
+eq(ipa.imei_of('35123'), null, 'imei: a short one is not');
+eq(ipa.imei_of('3512345678901x3'), null, 'imei: nor one that is not all digits');
+eq(ipa.imei_of(null), null, 'imei: no IMEI, none');
 
 eq(ipa.interval_of({}), 3600, 'interval: default 3600 s');
 eq(ipa.interval_of({ ipa_interval: 60 }), 300, 'interval: floored at 300 s');
@@ -52,19 +53,16 @@ eq(ipa.due({ online_since: 1000, last_end: 2000, last_ok: false, fails: 3 }, {},
 eq(ipa.due({ online_since: 1000, last_end: 2000, last_ok: false, fails: 9 }, {}, T2), 5600,
 	'due: but never beyond the interval');
 
-eq(ipa.build_cmd({ ipad: '/x/ipad', nvstate: '/s/E.nvstate' }),
-	"/x/ipad -E -H -n '/s/E.nvstate' 2>&1",
-	'cmd: always emulation (-E) and host-driven (-H), its log into the pipe (syslog)');
-eq(ipa.build_cmd({ ipad: '/x/ipad', nvstate: '/s/E.nvstate', tac: '35123456',
-                   eim_id: 'eim.example', insecure: true, init_cfg: '/etc/e.ber' }),
-	"/x/ipad -E -H -n '/s/E.nvstate' -t 35123456 -e 'eim.example' -I -f '/etc/e.ber' 2>&1",
-	'cmd: TAC, eIM id, insecure and the provisioning file');
-
-// its log lines, as libipa/log.c writes them ("%8s %8s " subsystem, level)
-eq(ipa.log_level('    HTTP    ERROR HTTP request failed'), 'warn', 'log: ERROR is a warning');
-eq(ipa.log_level('     IPA     INFO Generic eUICC Package Download'), 'info', 'log: INFO is info');
-eq(ipa.log_level('   SCARD    DEBUG stdio TX: 81E2910003BF2200'), 'debug', 'log: DEBUG (the APDU traffic) is debug');
-eq(ipa.log_level(' nvstate path: /etc/wwand/ipa/x'), 'debug', 'log: main.c parameter chatter is debug');
+eq(ipa.build_cmd({ ipad: '/x/ipad', dir: '/s' }),
+	"/x/ipad -s '/s' poll 2>&1",
+	'cmd: the state directory and the poll; stderr into the pipe');
+eq(ipa.build_cmd({ ipad: '/x/ipad', dir: '/s', backend: 'emu', eim_id: 'eim.example', insecure: true,
+                   imei: '351234567890123', direct: true, cmd: 'provision', file: '/etc/e.ber' }),
+	"/x/ipad -s '/s' -b emu -e 'eim.example' -k -i 351234567890123 -D provision '/etc/e.ber' 2>&1",
+	'cmd: backend, eIM id, insecure, IMEI, direct download and a file argument');
+eq(ipa.build_cmd({ ipad: '/x/ipad', dir: '/s', backend: 'auto' }), "/x/ipad -s '/s' poll 2>&1",
+	'cmd: auto is the assistant\'s default, not passed');
+eq(ipa.log_level('ipad: -r wants 6 hex digits'), 'notice', 'log: what reaches the pipe is worth seeing');
 
 // --- the scheduler against a fake bridge ---------------------------------------
 
@@ -82,10 +80,26 @@ let script = null;           // what the fake assistant does in a run
 let refreshes = [];          // profile-list re-reads the scheduler asked for
 let card_after = null;       // the profile list a re-read finds
 
+// the assistant as the fake plays it by default: says what card it found,
+// then exits 3 while the card has no eIM (ipad main.c EXIT_NO_EIM), stores
+// one on `provision`, and polls fine once it has one
+let provisioned = false;
+let fake_ipad = (cmd, on_ipa, on_done) => {
+	on_ipa({ kind: 'event', event: 'info', payload: { eid: EID, backend: 'emulated', key_fingerprint: 'AB12' } }, () => {
+		if (index(cmd, ' provision ') >= 0) {
+			provisioned = true;
+			return on_done(null, '');
+		}
+
+		on_done(provisioned ? null : { error: 'lpac', code: 3 }, '');
+	});
+	return null;
+};
+
 let bridge = {
 	session_run: (ref, slot, label, cmd, log_level, on_ipa, on_done) => {
 		push(runs, cmd);
-		return script ? script(on_ipa, on_done) : (on_done(null, ''), null);
+		return script ? script(on_ipa, on_done, cmd) : fake_ipad(cmd, on_ipa, on_done);
 	},
 	apply_sim_reset: (ref, slot, cb) => { resets++; cb(null, reset_res); },
 };
@@ -94,7 +108,6 @@ let modem = { info: { imei: '351234567890123' } };
 
 let mk = (over) => ipa.scheduler({
 	bridge: bridge,
-	esim: { get_eid: (m, slot, cb) => cb(null, { eid: EID }) },
 	log: (lvl, msg) => push(logs, msg),
 	modem_of: (ref) => (ref == 'm1') ? { modem: modem } : null,
 	online: () => online,
@@ -130,25 +143,29 @@ eq(length(runs), 0, 'tick: online, but not settled yet');
 clock += 60;
 s.tick('m1', on);
 eq(s.status('m1', on).last_error, 'no_eim_config',
-	'first run: a card without nvstate and no eIM configuration is refused, not guessed');
-eq(length(runs), 0, 'first run: the assistant is not started without an eIM');
+	'first run: the card has no eIM and none is configured: refused, not guessed');
+eq(length(runs), 1, 'first run: the assistant was asked (it knows whether the card has an eIM)');
+eq(s.status('m1', on).eid, EID, 'first run: the card it reported is in status');
+eq(s.status('m1', on).backend, 'emulated', 'first run: ...and how it drives it');
+eq(s.status('m1', on).key_fingerprint, 'AB12', 'first run: ...and the device key the eIM must know');
 
-// provisioning: the configured eIM file exists, the card has no nvstate yet
+// provisioning: the configured eIM file exists, the card has none yet
 files['/etc/wwand/eim.ber'] = true;
 let cfg = { ipa: true, ipa_eim_config: '/etc/wwand/eim.ber' };
+runs = [];
 clock += 600;
 s.tick('m1', cfg);
-eq(length(runs), 2, 'provision: one run stores the eIM, a second polls it');
-ok(index(runs[0], "-f '/etc/wwand/eim.ber'") >= 0, 'provision: first run carries -f');
-ok(index(runs[1], '-f') < 0, 'provision: the poll does not');
-ok(index(runs[0], sprintf("-n '/s/%s.nvstate'", EID)) >= 0, 'provision: nvstate keyed by the card\'s EID');
-ok(index(runs[0], '-t 35123456') >= 0, 'provision: TAC from the modem\'s IMEI');
+eq(length(runs), 3, 'provision: the poll says no eIM, provision stores it, a second poll uses it');
+ok(index(runs[1], "provision '/etc/wwand/eim.ber'") >= 0, 'provision: the second run stores the file');
+ok(index(runs[0], ' poll ') >= 0 && index(runs[2], ' poll ') >= 0, 'provision: the others poll');
+ok(index(runs[0], "-s '/s'") >= 0, 'provision: the state directory is passed');
+ok(index(runs[0], '-i 351234567890123') >= 0, 'provision: the modem\'s IMEI for DeviceInfo');
+ok(index(runs[0], ' -D ') >= 0, 'provision: direct download offered by default');
 eq(s.status('m1', cfg).last_ok, true, 'provision: the run counts as good');
 
-eq(refreshes, [ [ 'm1', EID, 1 ] ], 'refresh: the profile list is read again after a run that reached the card');
+eq(refreshes[length(refreshes) - 1], [ 'm1', EID, 1 ], 'refresh: the profile list is read again after a run that reached the card');
 
-// the nvstate exists now: a later run only polls
-files[sprintf('/s/%s.nvstate', EID)] = true;
+// the card has its eIM now: a later run only polls
 runs = [];
 clock += 4000;
 s.tick('m1', cfg);
@@ -276,7 +293,7 @@ uloop.timer(20, () => { online = 'wan:6'; });
 uloop.timer(150, () => uloop.end());
 uloop.run();
 eq(s.status('m1', cfg).last_changes,
-	{ switched: [ { from: 'A', to: 'B', rollback: false } ], installed: [ 'C' ], deleted: [ 'D' ] },
+	{ switched: [ { from: 'A', to: 'B', rollback: false } ], installed: [ 'C' ], deleted: [ 'D' ], downloads: [] },
 	'changes: the switch, and what the list comparison found installed and deleted');
 
 // the eIM stays unreachable on B: the assistant rolls back to A in the same run
@@ -317,7 +334,7 @@ card_after = [ 'A', 'B' ];
 script = null;
 clock += 4000;
 s.tick('m1', cfg);
-eq(s.status('m1', cfg).last_changes, { switched: [], installed: null, deleted: null },
+eq(s.status('m1', cfg).last_changes, { switched: [], installed: null, deleted: null, downloads: [] },
 	'changes: without a list from before, nothing is claimed installed');
 
 // the SIM power cycle fails: the modem is reset instead, and the new ICCID is
@@ -353,6 +370,83 @@ s.tick('m1', cfg);
 eq(refreshes[0]?.[2], 2, 'slot: the active eUICC\'s physical slot, not the configured one');
 delete modem.slot_status;
 
+// --- connectivity, download, export --------------------------------------------
+
+{
+	let ups = [], dls = [], replies = [];
+	let dl_err = null;
+	let s2 = mk({
+		sim_upsert: (iccid, fields, origin, opts) => {
+			push(ups, [ iccid, fields, origin, opts ]);
+			return { written: true, section: 'wwsim_' + iccid };
+		},
+		download: (ref, code, cc, cb) => { push(dls, [ ref, code, cc ]); cb(dl_err); },
+	});
+	let ev = (event, payload) => (on_ipa, on_done) => {
+		on_ipa({ kind: 'event', event: event, payload: payload }, (obj) => {
+			push(replies, obj);
+			on_done(null, '');
+		});
+		return null;
+	};
+
+	provisioned = true;
+	online = 'wan:40';
+
+	// an IoT eUICC states its parameters: written, kept current
+	script = ev('connectivity', { iccid: '89000123456789012342', emulated: false, source: 'card',
+		apn: 'iot.example', username: 'u', password: 'p', pdp_type: 'ipv4' });
+	s2.poll('m1', cfg, () => null);
+	eq(ups, [ [ '89000123456789012342', { apn: 'iot.example', pdp_type: 'ipv4', username: 'u', password: 'p', auth: 'both' },
+	            'ipa', { create_only: false } ] ],
+		'connectivity: the card\'s parameters go to sim_upsert, credentials with auth both');
+	eq(replies, [ {} ], 'connectivity: answered');
+	eq(s2.status('m1', cfg).connectivity,
+		{ iccid: '89000123456789012342', source: 'card', apn: 'iot.example', pdp_type: 'ipv4',
+		  section: 'wwsim_89000123456789012342', written: true, reason: null },
+		'connectivity: status says what was written where (the password is not in it)');
+
+	// an emulated SGP.22 card has none: the section is only created, never emptied
+	ups = [];
+	script = ev('connectivity', { iccid: '89000123456789012342', emulated: true, source: 'none' });
+	s2.poll('m1', cfg, () => null);
+	eq(ups, [ [ '89000123456789012342', {}, 'ipa', { create_only: true } ] ],
+		'connectivity: nothing stated, nothing but the section, and only when there is none');
+	eq(s2.status('m1', cfg).connectivity.source, 'emulated: none', 'connectivity: the source says why the APN is empty');
+
+	// a malformed ICCID never reaches the writer
+	ups = [];
+	script = ev('connectivity', { iccid: '8900; reboot', source: 'card', apn: 'x' });
+	s2.poll('m1', cfg, () => null);
+	eq(ups, [], 'connectivity: an ICCID that is not one is not written');
+
+	// a direct download goes to lpac through the bridge
+	replies = [];
+	script = ev('download', { activation_code: '1$smdp.example$MATCH' });
+	s2.poll('m1', cfg, () => null);
+	eq(dls, [ [ 'm1', '1$smdp.example$MATCH', null ] ], 'download: the activation code reaches the bridge');
+	eq(replies, [ { ok: true } ], 'download: success is reported back');
+	eq(s2.status('m1', cfg).last_changes.downloads, [ { ok: true } ], 'download: and recorded');
+	ok(index(join(' ', logs), 'MATCH') < 0, 'download: the activation code is not logged');
+
+	dl_err = { error: 'download_failed' };
+	replies = [];
+	s2.poll('m1', cfg, () => null);
+	eq(replies, [ { ok: false, error: 'download_failed' } ], 'download: a failure too');
+	dl_err = null;
+
+	// export: its own run with the file argument
+	runs = [];
+	script = null;
+	let eres = null;
+	s2.export('m1', cfg, '/tmp/wwand/dev.json', (e, r) => { eres = [ e, r ]; });
+	ok(index(runs[0] ?? '', " export '/tmp/wwand/dev.json'") >= 0, 'export: ipad export with the file');
+	eq(eres, [ null, { file: '/tmp/wwand/dev.json' } ], 'export: answers with the file');
+	s2.export('m1', cfg, "/tmp/x'; reboot", (e, r) => { eres = [ e, r ]; });
+	eq(eres[0]?.error, 'invalid_argument', 'export: a path with shell characters is refused');
+	script = null;
+}
+
 // --- the real bridge: the assistant's log reaches the syslog, not a file ------
 
 import * as fs from 'fs';
@@ -362,10 +456,10 @@ let tmp = getenv('TMPDIR') ?? '/tmp';
 let stub = sprintf('%s/wwand-test-ipad.sh', tmp);
 let sf = fs.open(stub, 'w');
 sf.write("#!/bin/sh\n" +
-	"echo '    HTTP    ERROR eIM unreachable' >&2\n" +
-	"echo '{\"type\":\"event\",\"payload\":{\"event\":\"profile_changed\"}}'\n" +
+	"echo 'ipad: usage trouble' >&2\n" +
+	"echo '{\"type\":\"event\",\"payload\":{\"event\":\"connectivity\",\"iccid\":\"8949\",\"apn\":\"iot.ex\\\\\"q\"}}'\n" +
 	"read line\n" +
-	"echo \"   SCARD    DEBUG host said $line\" >&2\n" +
+	"echo \"host said $line\" >&2\n" +
 	"exit 3\n");
 sf.close();
 
@@ -378,8 +472,9 @@ let br = bridge_mod.create({ esim: {}, log: (lvl, msg) => push(seen, [ lvl, msg 
 let rres = null;
 
 uloop.init();
+let got_payload = null;
 let started = br.session_run('m0', 1, 'ipa', sprintf('sh %s 2>&1', stub), ipa.log_level,
-	(rec, reply) => reply({ online: true }),
+	(rec, reply) => { got_payload = rec.payload; reply({ online: true }); },
 	(err, out) => { rres = { err, out }; uloop.end(); });
 uloop.timer(5000, () => uloop.end());
 uloop.run();
@@ -393,21 +488,29 @@ let lvl_of = (needle) => {
 			return e[0];
 	return null;
 };
-eq(lvl_of('eIM unreachable'), 'warn', 'bridge: its ERROR line reaches the syslog as a warning');
-eq(lvl_of('host said {"type":"event","payload":{ "online": true }}'), 'debug',
-	'bridge: the answer to profile_changed arrived, and its DEBUG line is debug');
+eq(lvl_of('usage trouble'), 'notice', 'bridge: what ipad writes to stderr reaches the syslog');
+// the script holds iot.ex\\"q; dash's echo halves the backslash pair, so the
+// line carries the JSON string iot.ex\"q, a quote in the value
+eq(got_payload?.apn, 'iot.ex"q', 'bridge: the event payload reaches the plugin, escapes undone');
+eq(got_payload?.iccid, '8949', 'bridge: ...every field of it');
+ok(lvl_of('host said {"type":"event","payload":{ "online": true }}') != null,
+	'bridge: the answer went back to the process');
 eq(fs.readfile('/tmp/wwand/esim-download.log'), 'lpac run\n', 'bridge: lpac\'s log file is left alone');
 fs.unlink(stub);
 
 // --- the plugin wwand loads (plugins.uc) ------------------------------------------
 
 eq(ipa.name, 'ipa', 'plugin: its name');
-eq(ipa.options, [ 'ipa', 'ipa_interval', 'ipa_eim_config', 'ipa_eim_id', 'ipa_insecure' ],
+eq(ipa.options, [ 'ipa', 'ipa_interval', 'ipa_eim_config', 'ipa_eim_id', 'ipa_insecure', 'ipa_backend', 'ipa_direct' ],
 	'plugin: the options wwand hands over');
 eq(ipa.cfg_of({ ipa: '1', ipa_interval: '900', ipa_eim_config: '/e.ber', ipa_eim_id: '', ipa_insecure: '0' },
               { cfg: { sim_slot: 2 } }),
-	{ ipa: true, ipa_interval: 900, ipa_eim_config: '/e.ber', ipa_eim_id: null, ipa_insecure: false, sim_slot: 2 },
+	{ ipa: true, ipa_interval: 900, ipa_eim_config: '/e.ber', ipa_eim_id: null, ipa_insecure: false,
+	  ipa_backend: 'auto', ipa_direct: true, sim_slot: 2 },
 	'plugin: raw uci values become typed, empty is unset, sim_slot from the modem');
+eq(ipa.cfg_of({ ipa_backend: 'emu', ipa_direct: '0' }).ipa_backend, 'emu', 'plugin: backend emu');
+eq(ipa.cfg_of({ ipa_backend: 'emu', ipa_direct: '0' }).ipa_direct, false, 'plugin: direct download off');
+eq(ipa.cfg_of({ ipa_backend: 'x; reboot' }).ipa_backend, 'auto', 'plugin: an unknown backend is auto');
 eq(ipa.cfg_of({ ipa_interval: 'soon' }).ipa_interval, null, 'plugin: an interval that is no number is unset');
 
 let bridge_on = true;

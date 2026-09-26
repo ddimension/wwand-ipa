@@ -5,27 +5,27 @@
 //
 // An eIM is the operator's fleet server: it queues eUICC packages (download
 // this profile, enable that one, delete another) and the IoT Profile Assistant
-// on the device fetches and executes them. The assistant here is onomondo-ipa
-// (AGPL, a separate program: /usr/lib/wwand/ipad from the feed's wwand-ipad
-// package), built with a card backend that speaks lpac's stdio protocol, so
-// esim_bridge relays its APDUs over the modem's own channel exactly as it does
-// for lpac. This module decides WHEN it runs and does what only the host can:
-// make the modem use a profile the eIM has just switched to.
+// on the device fetches and executes them. The assistant here is ipad
+// (github.com/ddimension/ipad, GSMA SGP.32 v1.3; /usr/lib/wwand/ipad from the
+// feed's wwand-ipad package). It reaches the card through lpac's stdio
+// protocol, so esim_bridge relays its APDUs over the modem's own channel
+// exactly as it does for lpac. This module decides WHEN it runs and does what
+// only the host can:
+// - make the modem use a profile the eIM has just switched to (event
+//   `profile_changed`), and say whether the connection came back — if not, the
+//   assistant rolls the change back (SGP.32 3.3.2) and hands that change to us
+//   the same way;
+// - run a direct profile download through lpac (event `download`, SGP.32
+//   3.2.3.1);
+// - put the enabled profile's connectivity parameters into a wwand_sim section
+//   for its ICCID (event `connectivity`, SGP.32 5.9.24).
 //
-// Two facts shape it:
-// - onomondo-ipa implements SGP.32 v1.0 and is always run in its IoT eUICC
-//   EMULATION mode (-E) here, which drives an ordinary SGP.22 consumer eUICC —
-//   the cards wwand-esim already manages. In that mode the eIM configuration
-//   and the replay counter live in the assistant's nvstate file, not on the
-//   card; that file is keyed by EID below and must survive an upgrade, hence
-//   /etc. The eIM has to accept emulation-mode results: their signature is a
-//   placeholder (onomondo-ipa es10b_load_euicc_pkg.c:550, commit 6aaeb38,
-//   2026-09-01).
-// - A profile change is finished only when the modem runs the new profile AND
-//   the result has reached the eIM over it. The assistant cannot do the first
-//   part, so it hands it to us (event `profile_changed`) and waits; if the eIM
-//   stays unreachable it rolls the profile back itself on its next poll, and
-//   hands that change to us the same way.
+// ipad drives an IoT eUICC as it is, and an ordinary SGP.22 consumer eUICC by
+// emulating the SGP.32 functions: then the eIM configuration and the replay
+// counters live in its state directory (/etc/wwand/ipa, kept across upgrades),
+// and results are signed with a device key there, which the eIM learns from
+// `wwandctl ipa export`. Such a card has no connectivity parameters, so its
+// wwand_sim section is created empty, for the user to fill in.
 //
 // Exportless plain script: require() returns the API — the plugin object wwand
 // expects (name, options, create), plus the pure pieces the tests reach.
@@ -37,8 +37,12 @@ import * as uloop from 'uloop';
 
 const IPAD = '/usr/lib/wwand/ipad';
 
+// ipad's exit status when the card has no eIM configuration (ipad main.c)
+const EXIT_NO_EIM = 3;
+
 // the wwand_modem options this plugin reads (wwand hands them over raw)
-const OPTIONS = [ 'ipa', 'ipa_interval', 'ipa_eim_config', 'ipa_eim_id', 'ipa_insecure' ];
+const OPTIONS = [ 'ipa', 'ipa_interval', 'ipa_eim_config', 'ipa_eim_id', 'ipa_insecure',
+	'ipa_backend', 'ipa_direct' ];
 
 let truthy = (v) => (v === true || v == '1' || v == 'true' || v == 'on' || v == 'yes');
 
@@ -46,6 +50,8 @@ let truthy = (v) => (v === true || v == '1' || v == 'true' || v == 'on' || v == 
 // ipa_interval stays null when it is not a number, and interval_of then takes
 // the default. sim_slot is the modem's own option, from its entry: the slot to
 // fall back to when the modem cannot say which one holds the active eUICC.
+// ipa_backend: auto (the assistant probes the card), iot or emu; anything else
+// is auto. ipa_direct (default on): offer direct downloads, run through lpac.
 function cfg_of(ext, entry)
 {
 	let str = (v) => (v != null && v != '') ? '' + v : null;
@@ -57,6 +63,8 @@ function cfg_of(ext, entry)
 		ipa_eim_config: str(ext?.ipa_eim_config),
 		ipa_eim_id: str(ext?.ipa_eim_id),
 		ipa_insecure: truthy(ext?.ipa_insecure),
+		ipa_backend: (ext?.ipa_backend in [ 'iot', 'emu' ]) ? ext.ipa_backend : 'auto',
+		ipa_direct: (str(ext?.ipa_direct) == null) ? true : truthy(ext.ipa_direct),
 		sim_slot: entry?.cfg?.sim_slot,
 	};
 }
@@ -93,12 +101,12 @@ const INTERVAL_MIN = 300;
 let safe_path = (p) => type(p) == 'string' && match(p, /^\/[A-Za-z0-9._\/-]+$/) && !match(p, /\.\./);
 let safe_id = (s) => type(s) == 'string' && match(s, /^[A-Za-z0-9._:-]+$/);
 
-// The TAC is the first 8 digits of the IMEI (3GPP TS 23.003 6.2.1). The eIM may
-// use it to tell device models apart; the assistant's own default is a
-// placeholder, so the real one is passed whenever the modem reported an IMEI.
-function tac_of(imei)
+// The IMEI goes to the assistant for DeviceInfo (SGP.22 4.2), whose TAC is
+// its first 8 digits (3GPP TS 23.003 6.2.1): the eIM and the SM-DP+ may tell
+// device models apart by it. Only a well-formed one is passed.
+function imei_of(imei)
 {
-	return (type(imei) == 'string' && match(imei, /^[0-9]{14,16}$/)) ? substr(imei, 0, 8) : null;
+	return (type(imei) == 'string' && match(imei, /^[0-9]{14,16}$/)) ? imei : null;
 }
 
 function interval_of(cfg)
@@ -163,54 +171,50 @@ function due(st, cfg, timing)
 	return st.last_end + ((back < iv) ? back : iv);
 }
 
-// The assistant's command line. Always -E (a consumer eUICC, see the header)
-// and -H (profile changes go to the host). `init_cfg` makes it a provisioning
-// run: it stores the eIM configuration (an AddInitialEimRequest, BER) in the
-// nvstate and exits.
-//
-// stderr (its log) goes into the protocol pipe, 2>&1: the bridge takes every
-// line that is not protocol JSON as a log line, and log_level below maps it
-// onto wwand's own levels. So the assistant's log is in the syslog, filtered
-// by wwand's log level, with no file of its own to find or rotate.
+// The assistant's command line: ipad [options] <cmd> [file].
+//   -s  its state directory (emulation state per EID, the device key)
+//   -b  backend, -e eIM id, -k no TLS verification (lab only), -i IMEI,
+//   -D  offer direct download (the `download` event goes to lpac)
+// Its log goes to the syslog itself; stderr (usage errors, nothing else
+// without -v) joins the protocol pipe, 2>&1, where the bridge logs every line
+// that is not protocol JSON.
 function build_cmd(o)
 {
-	let parts = [ o.ipad ?? IPAD, '-E', '-H', '-n', sprintf("'%s'", o.nvstate) ];
+	let parts = [ o.ipad ?? IPAD, '-s', sprintf("'%s'", o.dir) ];
 
-	if (o.tac)
-		push(parts, '-t', o.tac);
+	if (o.backend && o.backend != 'auto')
+		push(parts, '-b', o.backend);
 
 	if (o.eim_id)
 		push(parts, '-e', sprintf("'%s'", o.eim_id));
 
 	if (o.insecure)
-		push(parts, '-I');
+		push(parts, '-k');
 
-	if (o.init_cfg)
-		push(parts, '-f', sprintf("'%s'", o.init_cfg));
+	if (o.imei)
+		push(parts, '-i', o.imei);
+
+	if (o.direct)
+		push(parts, '-D');
+
+	push(parts, o.cmd ?? 'poll');
+
+	if (o.file)
+		push(parts, sprintf("'%s'", o.file));
 
 	return sprintf('%s 2>&1', join(' ', parts));
 }
 
-// The syslog level for one line of the assistant's log. Its format is
-// "%8s %8s " subsystem and level, then the message (onomondo-ipa
-// libipa/log.c:69, levels ERROR/INFO/DEBUG at :40-43, commit 6aaeb38,
-// 2026-09-01).
-// ERROR goes to warn, not err: an eIM that is briefly unreachable logs ERROR
-// on every retry, and that is a condition, not a fault of the router.
-// Anything else (main.c's printf of its parameters) is debug.
+// What reaches the pipe outside the protocol is what ipad could not log to
+// the syslog: a usage error, a stuck start. Worth seeing, not an alarm.
 function log_level(line)
 {
-	let m = match(line ?? '', /^ *[A-Za-z0-9]+ +(ERROR|INFO|DEBUG) /);
-
-	if (!m)
-		return 'debug';
-
-	return { ERROR: 'warn', INFO: 'info', DEBUG: 'debug' }[m[1]];
+	return 'notice';
 }
 
 return {
 	// exposed for tests (test_ipa)
-	tac_of: tac_of,
+	imei_of: imei_of,
 	spread_of: spread_of,
 	interval_of: interval_of,
 	due: due,
@@ -218,12 +222,15 @@ return {
 	log_level: log_level,
 
 	// The scheduler proper, on typed options (cfg_of) and direct deps:
-	// deps: { bridge (an esim_bridge instance), esim (wwand.esim), log,
+	// deps: { bridge (an esim_bridge instance), log,
 	//         modem_of(ref), online(ref) -> a token for the current connection
 	//         generation, or null while not connected,
 	//         refresh(ref, eid, slot, cb(profiles)) -> re-read the card's
 	//         profile list into status, then hand it to cb,
-	//         modem_reset(ref, cb) -> the daemon's modem reset (hwops) }
+	//         modem_reset(ref, cb) -> the daemon's modem reset (hwops),
+	//         sim_upsert(iccid, fields, origin, opts) -> the daemon's writer,
+	//         download(ref, code, cc, cb(err)) -> a direct download under
+	//         the running session (esim_bridge session_download) }
 	// test seams: ipad_path, state_dir, timing, now(), exists(path)
 	scheduler: function(deps) {
 		let log = deps.log;
@@ -260,7 +267,7 @@ return {
 		};
 
 		// the one place a run ends; everything else only returns into it
-		let finish = (ref, st, ok, error, cb) => {
+		let finish = (ref, st, ok, error, cb, result) => {
 			st.seq++;   // anything still pending from this run is stale now
 			st.state = 'idle';
 			st.last_end = now();
@@ -270,7 +277,7 @@ return {
 			st.runs++;
 
 			if (ok)
-				log('info', sprintf('modem %s: ipa: poll done', ref));
+				log('info', sprintf('modem %s: ipa: %s done', ref, st.why ?? 'poll'));
 			else
 				log('warn', sprintf('modem %s: ipa: run failed (%s)', ref, error ?? '?'));
 
@@ -279,11 +286,11 @@ return {
 			// read again after every run that reached the card — failed ones
 			// too, a package can fail halfway.
 			//
-			// The list is also how installs and deletions become visible at
-			// all: the assistant reports neither, and the eIM package result
-			// it sends carries codes, not ICCIDs (onomondo-ipa
-			// es10b_load_euicc_pkg.h, commit 6aaeb38, 2026-09-01). So the
-			// list from before the run is compared with the one after it.
+			// The list is also how installs and deletions become visible here
+			// at all: the assistant does not report them to the host, and the
+			// eUICC Package Result it sends the eIM carries result codes, not
+			// the profile list (SGP.32 v1.3 EuiccResultData). So the list from
+			// before the run is compared with the one after it.
 			if (st.reached_card && type(deps.refresh) == 'function') {
 				let before = st.profiles_before;
 				let changes = st.changes;
@@ -310,7 +317,7 @@ return {
 			st.last_changes = st.changes;
 			st.reached_card = false;
 
-			cb?.(ok ? null : { error: 'ipa', detail: error }, null);
+			cb?.(ok ? null : { error: 'ipa', detail: error }, result ?? null);
 		};
 
 		// A profile change inside the run: reset the SIM so the modem takes the
@@ -402,7 +409,101 @@ return {
 			});
 		};
 
-		let run = (ref, cfg, why, cb) => {
+		// A direct download the eIM asked for (SGP.32 3.2.3.1), through lpac
+		// under the assistant's own claim on the card. The install
+		// notification stays on the card: the assistant reports it to the eIM.
+		// The activation code is not logged; it may be a one-time secret.
+		let on_download = (ref, st, p, reply) => {
+			let mine = st.seq;
+
+			if (type(deps.download) != 'function')
+				return reply({ ok: false, error: 'unsupported' });
+
+			log('notice', sprintf('modem %s: ipa: the eIM asked for a profile download', ref));
+			st.state = 'downloading';
+
+			let dl = { ok: null };
+
+			push(st.changes.downloads, dl);
+
+			deps.download(ref, p?.activation_code, p?.confirmation_code, (err) => {
+				if (st.seq != mine)
+					return;   // the run is over; nobody waits for this answer
+
+				st.state = 'running';
+				dl.ok = !err;
+				log(err ? 'warn' : 'notice', sprintf('modem %s: ipa: download %s%s', ref,
+					err ? 'failed' : 'done', err ? sprintf(' (%s)', err.error ?? '?') : ''));
+				reply(err ? { ok: false, error: err.error ?? 'failed' } : { ok: true });
+			});
+		};
+
+		// The enabled profile's connectivity parameters (SGP.32 5.9.24) into a
+		// wwand_sim section for its ICCID. What the card states is written and
+		// kept current. A card that states nothing (always so for an emulated
+		// SGP.22 card) still gets its section, but only created, never
+		// updated, so an APN the user fills in stays. A hand-written wwand_sim
+		// for the card always wins: sim_upsert does not touch it.
+		let on_connectivity = (ref, st, p, reply) => {
+			let from_card = (p?.source == 'card');
+			let fields = {};
+
+			if (from_card) {
+				fields.apn = p.apn;
+				fields.pdp_type = p.pdp_type;
+
+				// TS 102 223 carries login and password but no method
+				if (length(p.username ?? '') || length(p.password ?? '')) {
+					fields.username = p.username;
+					fields.password = p.password;
+					fields.auth = 'both';
+				}
+			}
+
+			let r = (type(deps.sim_upsert) == 'function' && match(p?.iccid ?? '', /^[0-9]{18,20}$/))
+				? deps.sim_upsert(p.iccid, fields, 'ipa', { create_only: !from_card })
+				: { written: false, reason: 'unsupported' };
+
+			st.connectivity = {
+				iccid: p?.iccid,
+				source: from_card ? 'card' : (p?.emulated ? 'emulated: none' : 'none'),
+				apn: fields.apn,
+				pdp_type: fields.pdp_type,
+				section: r?.section,
+				written: !!r?.written,
+				reason: r?.reason,
+			};
+
+			if (r?.written)
+				log('notice', sprintf('modem %s: ipa: connectivity parameters of %s written to %s (%s)',
+					ref, p.iccid, r.section, from_card ? sprintf('apn %J', fields.apn) : 'none stated, left for you to fill in'));
+			else if (r?.reason == 'foreign')
+				log('info', sprintf('modem %s: ipa: %s has a wwand_sim of its own (%s); not touched', ref, p?.iccid, r.section));
+
+			reply({});
+		};
+
+		let on_event = (ref, st, slot, rec, reply) => {
+			switch (rec.event) {
+			case 'info':
+				st.eid = rec.payload?.eid;
+				st.backend = rec.payload?.backend;
+				st.key_fingerprint = rec.payload?.key_fingerprint;
+				return reply({});
+			case 'profile_changed':
+				return on_profile_changed(ref, st, slot, reply);
+			case 'download':
+				return on_download(ref, st, rec.payload, reply);
+			case 'connectivity':
+				return on_connectivity(ref, st, rec.payload, reply);
+			}
+
+			log('warn', sprintf('modem %s: ipa: unknown event %s', ref, rec.event ?? '?'));
+			reply({ online: false });
+		};
+
+		// job: null for a poll, { cmd: 'export', file } for an export
+		let run = (ref, cfg, why, cb, job) => {
 			let entry = deps.modem_of(ref);
 			let st = state_of(ref);
 
@@ -434,78 +535,68 @@ return {
 			st.iccid_at_start = entry.modem.info?.iccid;
 			st.profiles_before = (type(entry.modem.esim_info?.profiles) == 'array')
 				? map(entry.modem.esim_info.profiles, (p) => p.iccid) : null;
-			st.changes = { switched: [], installed: null, deleted: null };
+			st.changes = { switched: [], installed: null, deleted: null, downloads: [] };
 			log('info', sprintf('modem %s: ipa: polling the eIM (%s)', ref, why));
 
 			pick_slot(entry.modem, cfg, (picked) => {
 				slot = picked;
 				st.slot = picked;
 
-				if (!deps.esim)
-					return finish(ref, st, false, 'esim_not_installed', cb);
+				let step;
+				step = (phase) => {
+					let cmd = build_cmd({
+						ipad: ipad, dir: dir,
+						backend: cfg?.ipa_backend,
+						eim_id: eim_id,
+						insecure: !!cfg?.ipa_insecure,
+						imei: imei_of(entry.modem.info?.imei),
+						direct: cfg?.ipa_direct !== false,
+						cmd: (phase == 'provision') ? 'provision' : (job?.cmd ?? 'poll'),
+						file: (phase == 'provision') ? init_cfg : job?.file,
+					});
 
-				deps.esim.get_eid(entry.modem, slot, (err, res) => {
-					let eid = uc(res?.eid ?? '');
+					// set BEFORE the call: the run may end inside it, and
+					// finish() reads this; a refused start takes it back
+					st.reached_card = true;
 
-					if (err || !match(eid, /^[0-9A-F]{32}$/))
-						return finish(ref, st, false, 'no_eid', cb);
+					let r = deps.bridge.session_run(ref, slot, 'ipa', cmd, log_level,
+						(rec, reply) => on_event(ref, st, slot, rec, reply),
+						(rerr) => {
+							let code = (rerr?.error == 'lpac') ? (rerr.code ?? -1) : null;
 
-					st.eid = eid;
+							// ipad exits 3 when the card has no eIM yet: store the
+							// configured one, then poll it. Asked of the assistant,
+							// not guessed from a file: on an IoT eUICC the
+							// configuration lives on the card.
+							if (code == EXIT_NO_EIM && phase == 'poll' && job == null) {
+								if (init_cfg == null)
+									return finish(ref, st, false, 'no_eim_config', cb);
 
-					// keyed by EID: the nvstate belongs to the CARD. Keyed by modem, a
-					// swapped card would inherit the previous card's eIM trust.
-					let nv = sprintf('%s/%s.nvstate', dir, eid);
-					let provision = !exists(nv);
+								if (!exists(init_cfg))
+									return finish(ref, st, false, 'eim_config_missing', cb);
 
-					if (provision && init_cfg == null)
-						return finish(ref, st, false, 'no_eim_config', cb);
+								return step('provision');
+							}
 
-					if (provision && !exists(init_cfg))
-						return finish(ref, st, false, 'eim_config_missing', cb);
+							if (rerr)
+								return finish(ref, st, false,
+									(code != null) ? sprintf('exit %d', code) : (rerr.error ?? 'error'), cb);
 
-					let step;
-					step = (phase) => {
-						let cmd = sprintf('mkdir -p %s && %s', dir, build_cmd({
-							ipad: ipad, nvstate: nv,
-							tac: tac_of(entry.modem.info?.imei),
-							eim_id: eim_id,
-							insecure: !!cfg?.ipa_insecure,
-							init_cfg: (phase == 'provision') ? init_cfg : null,
-						}));
+							if (phase == 'provision') {
+								log('notice', sprintf('modem %s: ipa: eIM configuration stored on card %s', ref, st.eid ?? '?'));
+								return step('poll');
+							}
 
-						// set BEFORE the call: the run may end inside it, and
-						// finish() reads this; a refused start takes it back
-						st.reached_card = true;
+							finish(ref, st, true, null, cb, job ? { file: job.file } : null);
+						});
 
-						let r = deps.bridge.session_run(ref, slot, 'ipa', cmd, log_level,
-							(rec, reply) => {
-								if (rec.event == 'profile_changed')
-									return on_profile_changed(ref, st, slot, reply);
+					if (r) {
+						st.reached_card = false;
+						finish(ref, st, false, r.error, cb);
+					}
+				};
 
-								log('warn', sprintf('modem %s: ipa: unknown event %s', ref, rec.event ?? '?'));
-								reply({ online: false });
-							},
-							(rerr) => {
-								if (rerr)
-									return finish(ref, st, false,
-										(rerr.error == 'lpac') ? sprintf('exit %d', rerr.code ?? -1) : (rerr.error ?? 'error'), cb);
-
-								if (phase == 'provision') {
-									log('notice', sprintf('modem %s: ipa: eIM configuration stored for card %s', ref, eid));
-									return step('poll');
-								}
-
-								finish(ref, st, true, null, cb);
-							});
-
-						if (r) {
-							st.reached_card = false;
-							finish(ref, st, false, r.error, cb);
-						}
-					};
-
-					step(provision ? 'provision' : 'poll');
-				});
+				step('poll');
 			});
 		};
 
@@ -555,6 +646,16 @@ return {
 				}
 			},
 
+			// The eIM import file for the card (eim-euicc-import/1): the device
+			// key the eIM verifies an emulated card's results with. A run of
+			// its own, so it never meets a poll on the card.
+			export: function(ref, cfg, file, cb) {
+				if (!safe_path(file))
+					return cb({ error: 'invalid_argument', detail: 'file' });
+
+				run(ref, cfg, 'export', cb, { cmd: 'export', file: file });
+			},
+
 			status: function(ref, cfg) {
 				let st = state_of(ref);
 
@@ -579,7 +680,13 @@ return {
 					last_changes: st.last_changes,
 					next_due: cfg?.ipa ? due(st, cfg, timing) : null,
 					interval: interval_of(cfg),
-					nvstate: st.eid ? exists(sprintf('%s/%s.nvstate', dir, st.eid)) : null,
+					// what the assistant said about the card at the start of
+					// its last run: iot or emulated, and for an emulated one
+					// the device key the eIM must have imported
+					backend: st.backend,
+					key_fingerprint: st.key_fingerprint,
+					// the last connectivity report and what became of it
+					connectivity: st.connectivity,
 				};
 			},
 		};
@@ -603,16 +710,21 @@ return {
 			},
 		};
 
-		let esim = pd.esim();
-
 		let sch = this.scheduler({
 			bridge: bridge,
-			esim: esim,
 			log: pd.log,
 			modem_of: pd.modem_of,
 			online: pd.connection_token,
 			refresh: pd.esim_refresh,
 			modem_reset: pd.modem_reset,
+			sim_upsert: pd.sim_upsert,
+			download: (ref, code, cc, cb) => {
+				let br = pd.esim_bridge();
+
+				return (type(br?.session_download) == 'function')
+					? br.session_download(ref, code, cc, cb)
+					: cb({ error: 'esim_not_installed' });
+			},
 		});
 
 		return {
@@ -636,6 +748,9 @@ return {
 
 					sch.poll(ref, cfg, cb);
 				},
+				// modem_plugin { op: 'export', args: { file } } -> { file }
+				export: (ref, ext, args, cb) =>
+					sch.export(ref, cfg_of(ext, pd.modem_of(ref)), args?.file ?? '/tmp/wwand/ipa-export.json', cb),
 			},
 			read_ops: [ 'status' ],
 		};
