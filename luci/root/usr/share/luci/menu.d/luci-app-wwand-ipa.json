@@ -1,0 +1,15 @@
+{
+	"admin/network/wwand-ipa": {
+		"title": "eSIM Fleet",
+		"order": 62,
+		"action": {
+			"type": "view",
+			"path": "wwand/ipa"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-wwand-ipa"
+			]
+		}
+	}
+}
