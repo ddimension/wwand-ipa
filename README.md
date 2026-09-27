@@ -47,7 +47,11 @@ fetches and runs them. What the host adds:
   and reports that instead, and wwand applies the rollback the same way.
 - **Direct downloads run through lpac** (SGP.32 3.2.3.1), under the
   assistant's own claim on the card. The assistant reports the result to the
-  eIM. Indirect downloads (through the eIM) the assistant does itself.
+  eIM (step 13), and lpac then sends the Profile Installation Result to the
+  SM-DP+ (`notification process -r <seq>`, step 14): the eIM forwards only the
+  PIRs of indirect downloads. A failed delivery stays on the card and is sent
+  again on the next run. Indirect downloads (through the eIM) the assistant
+  does itself.
 - **The APN of the enabled profile lands in the config.** After every run, the
   assistant reads the enabled profile's connectivity parameters (SGP.32
   5.9.24). wwand writes them into a `wwand_sim` section for that ICCID,
@@ -121,7 +125,7 @@ wwandctl ipa [modem] provision /tmp/bundle.json
   `eim-euicc-import/1` file, signed with the bundle key, to
   `/ipad/v1/bind` on the eIM, over the same TLS as ESipa, and only then asks
   for packages. 204 or 409 (already registered): bound. 403: refused — the
-  card is not polled again until an operator acts (`reset`, a new bundle).
+  card is not polled again until an operator acts (`reset --all`, a new bundle).
   429, 5xx or no answer: tried again at the next poll.
 - An IoT eUICC takes only the configuration; it signs with its own
   certificate and does not bind.
@@ -206,7 +210,7 @@ wwandctl ipa [modem] eim <file>         # set the eIM, enable
 wwandctl ipa [modem] export <file>      # the eIM import file (emulated card)
 wwandctl ipa [modem] provision <bundle> # store a bundle, enable (JSON)
 wwandctl ipa [modem] info               # the card now (JSON)
-wwandctl ipa [modem] reset              # forget configuration, state, key (JSON)
+wwandctl ipa [modem] reset [--all]      # forget this card's state; --all: every card, key, binding (JSON)
 ```
 
 `provision`, `poll`, `info` and `reset` are for scripts too (the eIM lab's
@@ -230,13 +234,17 @@ messages for people go to stderr, and the exit status is
   IoT eUICC, which does not bind. `last_poll` is the time of the last poll.
 - `provision` answers like `info`, plus `bundle_deleted`, or with
   `bundle_kept` when the bundle could not be stored.
-- `reset` removes the eIM configuration of the emulation, its state, the
-  device key and the binding (`ipad reset`, no card needed); while a run
-  holds the card it waits up to 120 s. The uci options stay: with `option
+- `reset` removes the eIM configuration and state the emulation holds for
+  this modem's card (`ipad reset <EID>`, no card needed; without a known EID
+  an `info` run reads it first). The device key and the binding stay: every
+  modem on the router shares them. `reset --all` (`ipad reset all`) removes
+  every card's state, the device key and the binding, which a re-key or a
+  refused binding needs; it fails `busy` while any modem runs. While a run
+  holds the card, `reset` waits up to 120 s. The uci options stay: with `option
   ipa` on and no `ipa_eim_config`, polls then fail (`no_eim_config`) until
   something new is provisioned; **with `ipa_eim_config` set, the next poll
-  provisions that file again** — the old configuration, its old counter, and
-  a new key the eIM does not know. Replace the file (`wwandctl ipa eim`) or
+  provisions that file again** — the old configuration, its old counter (and,
+  after `--all`, a new key the eIM does not know). Replace the file (`wwandctl ipa eim`) or
   remove the option at the reset ([how-to](docs/howto.md#re-keying-after-a-lost-device-key)).
   An IoT eUICC keeps its eIM configuration; only the eIM can remove it.
 
@@ -247,7 +255,7 @@ messages for people go to stderr, and the exit status is
 - `export { file }`: answers `{ file }` when the file is written;
 - `provision { file }`: answers the card's info once the bundle is stored;
 - `info`: the card's info, read in a session of its own;
-- `reset`: `{ reset: true }`.
+- `reset { all }`: `{ reset: true, all }`.
 
 Only a poll moves the schedule; `export`, `provision` and `info` do not count
 as runs.

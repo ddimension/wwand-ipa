@@ -368,23 +368,26 @@ function info(ctx, modem, sys)
 	return (r?.ok === false) ? fail(sys, r) : emit(sys, info_line(r), EXIT_OK);
 }
 
-// `ipa <modem> reset`: forget the eIM configuration, the emulation state, the
-// device key and the binding. The uci options stay as they are.
-function reset(ctx, modem, sys)
+// `ipa <modem> reset [--all]`: forget this modem's card in the emulation (its
+// eIM configuration and state); with --all every card's, the device key and
+// the binding, which the state directory holds for every modem on the router.
+// The uci options stay as they are.
+function reset(ctx, modem, sys, all)
 {
 	sys = sys_of(sys);
 
-	let r = op_wait(ctx, modem, 'reset', {}, sys.now() + 120, sys);
+	let r = op_wait(ctx, modem, 'reset', { all: !!all }, sys.now() + 120, sys);
 
 	if (r?.ok === false)
 		return fail(sys, r);
 
 	let cur = sys.cursor();
+	let what = all ? 'reset of every card, the device key and the binding' : 'reset';
 
 	if (cur.get('network', modem, 'ipa') == '1' && !length(cur.get('network', modem, 'ipa_eim_config') ?? ''))
-		sys.err(sprintf('modem %s: reset; fleet management is still on and polls fail (no_eim_config) until a new bundle is provisioned\n', modem));
+		sys.err(sprintf('modem %s: %s; fleet management is still on and polls fail (no_eim_config) until a new bundle is provisioned\n', modem, what));
 	else
-		sys.err(sprintf('modem %s: reset\n', modem));
+		sys.err(sprintf('modem %s: %s\n', modem, what));
 
 	return emit(sys, { result: 'ok' }, EXIT_OK);
 }
@@ -463,7 +466,8 @@ return {
 		'ipa [modem] poll [--timeout S]        poll now, wait for the end of the run (default 300 s); JSON result',
 		'ipa [modem] poll --no-wait            only start the poll',
 		'ipa [modem] info                      the card now: EID, device key, binding, counter; JSON',
-		'ipa [modem] reset                     forget eIM configuration, state and device key; JSON result',
+		'ipa [modem] reset                     forget the eIM configuration and state of this card; JSON result',
+		'ipa [modem] reset --all               the same for every card, plus device key and binding; JSON result',
 	],
 
 	run: function(ctx, args) {
@@ -497,8 +501,14 @@ return {
 		case 'info':
 			exit(info(ctx, r.modem));
 
-		case 'reset':
-			exit(reset(ctx, r.modem));
+		case 'reset': {
+			let extra = slice(rest, 1);
+
+			if (length(extra) > 1 || (length(extra) == 1 && extra[0] != '--all'))
+				die('usage: wwandctl ipa [modem] reset [--all]');
+
+			exit(reset(ctx, r.modem, null, length(extra) == 1));
+		}
 
 		case 'eim':
 			if (!length(rest[1] ?? ''))
@@ -524,7 +534,7 @@ return {
 		}
 
 		default:
-			die('usage: wwandctl ipa [modem] [status|poll [--timeout S|--no-wait]|eim <file>|export <file>|provision <bundle>|info|reset]');
+			die('usage: wwandctl ipa [modem] [status|poll [--timeout S|--no-wait]|eim <file>|export <file>|provision <bundle>|info|reset [--all]]');
 		}
 	},
 };

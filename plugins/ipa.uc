@@ -16,7 +16,8 @@
 //   assistant rolls the change back (SGP.32 3.3.2) and hands that change to us
 //   the same way;
 // - run a direct profile download through lpac (event `download`, SGP.32
-//   3.2.3.1);
+//   3.2.3.1), and send its Profile Installation Result to the SM-DP+ through
+//   lpac too (event `notify`, 3.2.3.1 step 14);
 // - put the enabled profile's connectivity parameters into a wwand_sim section
 //   for its ICCID (event `connectivity`, SGP.32 5.9.24).
 //
@@ -176,7 +177,8 @@ function due(st, cfg, timing)
 // The assistant's command line: ipad [options] <cmd> [file].
 //   -s  its state directory (emulation state per EID, the device key)
 //   -b  backend, -e eIM id, -k no TLS verification (lab only), -i IMEI,
-//   -D  offer direct download (the `download` event goes to lpac)
+//   -D  offer direct download (the `download` event goes to lpac, and so
+//       does the `notify` event with the download's PIR for the SM-DP+)
 // Its log goes to the syslog itself; stderr (usage errors, nothing else
 // without -v) joins the protocol pipe, 2>&1, where the bridge logs every line
 // that is not protocol JSON.
@@ -232,7 +234,9 @@ return {
 	//         modem_reset(ref, cb) -> the daemon's modem reset (hwops),
 	//         sim_upsert(iccid, fields, origin, opts) -> the daemon's writer,
 	//         download(ref, code, cc, cb(err)) -> a direct download under
-	//         the running session (esim_bridge session_download) }
+	//         the running session (esim_bridge session_download),
+	//         notify(ref, seq, cb(err)) -> one pending notification to its
+	//         SM-DP+ over ES9+, under the running session (session_notify) }
 	// test seams: ipad_path, state_dir, timing, now(), exists(path)
 	scheduler: function(deps) {
 		let log = deps.log;
@@ -428,7 +432,9 @@ return {
 
 		// A direct download the eIM asked for (SGP.32 3.2.3.1), through lpac
 		// under the assistant's own claim on the card. The install
-		// notification stays on the card: the assistant reports it to the eIM.
+		// notification stays on the card: the assistant puts it into its
+		// result for the eIM (step 13), then hands it back to us for the
+		// SM-DP+ (on_notify, step 14).
 		// The activation code is not logged; it may be a one-time secret.
 		let on_download = (ref, st, p, reply) => {
 			let mine = st.seq;
@@ -451,6 +457,28 @@ return {
 				dl.ok = !err;
 				log(err ? 'warn' : 'notice', sprintf('modem %s: ipa: download %s%s', ref,
 					err ? 'failed' : 'done', err ? sprintf(' (%s)', err.error ?? '?') : ''));
+				reply(err ? { ok: false, error: err.error ?? 'failed' } : { ok: true });
+			});
+		};
+
+		// The Profile Installation Result of that download, to its SM-DP+
+		// over ES9+ (SGP.32 v1.3 3.2.3.1 step 14, 3.7 [2a]): the eIM forwards
+		// only PIRs of indirect downloads it ran (5.7.4), so this is the one
+		// way it gets there. lpac removes it from the card once the SM-DP+
+		// acknowledged it; a failure leaves it there and the assistant asks
+		// again on its next run. Nothing here decides NOT to send one.
+		let on_notify = (ref, st, p, reply) => {
+			let mine = st.seq;
+
+			if (type(deps.notify) != 'function')
+				return reply({ ok: false, error: 'unsupported' });
+
+			deps.notify(ref, p?.seq, (err) => {
+				if (st.seq != mine)
+					return;   // the run is over; nobody waits for this answer
+
+				log(err ? 'warn' : 'notice', sprintf('modem %s: ipa: install notification %s to the SM-DP+%s',
+					ref, err ? 'not sent' : 'sent', err ? sprintf(' (%s)', err.error ?? '?') : ''));
 				reply(err ? { ok: false, error: err.error ?? 'failed' } : { ok: true });
 			});
 		};
@@ -522,6 +550,8 @@ return {
 				return on_profile_changed(ref, st, slot, reply);
 			case 'download':
 				return on_download(ref, st, rec.payload, reply);
+			case 'notify':
+				return on_notify(ref, st, rec.payload, reply);
 			case 'connectivity':
 				return on_connectivity(ref, st, rec.payload, reply);
 			}
@@ -722,31 +752,71 @@ return {
 				run(ref, cfg, 'info', cb, { cmd: 'info', result: info_of });
 			},
 
-			// Forget the eIM configuration, the emulation state, the device
-			// key and the binding (`ipad reset`, no card needed), so that a
-			// fresh bundle starts from nothing. An IoT eUICC keeps its eIM
-			// configuration on the card: removing that is the eIM's eCO.
-			// Refused while a run holds the state.
-			reset: function(ref, cfg, cb) {
+			// Forget what the emulation holds for this modem's card: its eIM
+			// configuration and state (`ipad reset <EID>`, no card needed).
+			// The device key and the binding stay: they belong to the state
+			// directory, which every modem on the router shares, and a new
+			// key would leave the other cards' results unverifiable at the
+			// eIM. `opts.all` removes those too, and every card's state
+			// (`ipad reset all`), as a re-key needs; it waits for no run and
+			// is refused while any modem's run holds the directory. The EID
+			// is the one the last run read; without one, an `info` run reads
+			// it first. An IoT eUICC keeps its eIM configuration on the card:
+			// removing that is the eIM's eCO.
+			reset: function(ref, cfg, cb, opts) {
+				let self = this;
 				let st = state_of(ref);
+				let all = !!opts?.all;
 
 				if (st.state != 'idle')
 					return cb({ error: 'busy' });
 
+				if (all)
+					for (let r, o in states)
+						if (o.state != 'idle')
+							return cb({ error: 'busy', detail: sprintf('modem %s is running', r) });
+
 				if (!exists(ipad))
 					return cb({ error: 'ipa_not_installed', detail: sprintf('%s is missing (package wwand-ipad)', ipad) });
 
-				let rc = reset_run(sprintf("%s -s '%s' reset >/dev/null 2>&1", ipad, dir));
+				if (!all && st.eid == null)
+					return self.info(ref, cfg, (err) => {
+						if (err)
+							return cb(err);
+						if (state_of(ref).eid == null)
+							return cb({ error: 'no_eid', detail: 'the card did not tell its EID' });
+						self.reset(ref, cfg, cb, opts);
+					});
+
+				if (!all && !match(st.eid, /^[0-9A-Fa-f]{32}$/))
+					return cb({ error: 'invalid_argument', detail: 'eid' });
+
+				let rc = reset_run(sprintf("%s -s '%s' reset %s >/dev/null 2>&1", ipad, dir, all ? 'all' : st.eid));
 
 				if (rc != 0)
 					return cb({ error: 'ipa', detail: sprintf('reset: exit %s', rc) });
 
-				// what this module knew of the card is gone with it; the
-				// schedule (online since, spread) is the modem's and stays
-				states[ref] = { state: 'idle', seq: st.seq + 1, runs: 0, profile_changes: 0,
-				                online_since: st.online_since, spread: st.spread };
-				log('notice', sprintf('modem %s: ipa: reset — eIM configuration, state and device key forgotten', ref));
-				cb(null, { reset: true });
+				// what this module knew of the card is gone with it (with
+				// `all`, of every card); the schedule (online since, spread)
+				// is the modem's and stays
+				let forget = (r) => {
+					let o = state_of(r);
+
+					states[r] = { state: 'idle', seq: o.seq + 1, runs: 0, profile_changes: 0,
+					              online_since: o.online_since, spread: o.spread };
+				};
+
+				if (all) {
+					for (let r in keys(states))
+						forget(r);
+					log('notice', sprintf('modem %s: ipa: reset of every card — eIM configurations, states, device key and binding forgotten', ref));
+				} else {
+					let eid = st.eid;
+
+					forget(ref);
+					log('notice', sprintf('modem %s: ipa: reset of card %s — its eIM configuration and state forgotten', ref, eid));
+				}
+				cb(null, { reset: true, all: all });
 			},
 
 			status: function(ref, cfg) {
@@ -825,6 +895,13 @@ return {
 					? br.session_download(ref, code, cc, cb)
 					: cb({ error: 'esim_not_installed' });
 			},
+			notify: (ref, seq, cb) => {
+				let br = pd.esim_bridge();
+
+				return (type(br?.session_notify) == 'function')
+					? br.session_notify(ref, seq, cb)
+					: cb({ error: 'unsupported' });
+			},
 		});
 
 		return {
@@ -856,8 +933,8 @@ return {
 					sch.provision(ref, cfg_of(ext, pd.modem_of(ref)), args?.file ?? '', cb),
 				// modem_plugin { op: 'info' } -> { eid, card_type, bound, counter, … }
 				info: (ref, ext, args, cb) => sch.info(ref, cfg_of(ext, pd.modem_of(ref)), cb),
-				// modem_plugin { op: 'reset' } -> { reset: true }
-				reset: (ref, ext, args, cb) => sch.reset(ref, cfg_of(ext, pd.modem_of(ref)), cb),
+				// modem_plugin { op: 'reset', args: { all } } -> { reset: true, all }
+				reset: (ref, ext, args, cb) => sch.reset(ref, cfg_of(ext, pd.modem_of(ref)), cb, { all: !!args?.all }),
 			},
 			read_ops: [ 'status' ],
 		};

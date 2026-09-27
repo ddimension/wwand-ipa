@@ -218,7 +218,8 @@ wwandctl ipa [modem] eim <file>         # set the eIM configuration, enable
 wwandctl ipa [modem] export <file>      # the eIM import file (emulated card)
 wwandctl ipa [modem] provision <bundle> # store a bundle, enable (JSON)
 wwandctl ipa [modem] info               # the card now (JSON)
-wwandctl ipa [modem] reset              # forget configuration, state, key (JSON)
+wwandctl ipa [modem] reset              # forget this card's configuration and state (JSON)
+wwandctl ipa [modem] reset --all        # every card's, plus the device key and binding (JSON)
 ```
 
 `[modem]` is the `wwand_modem` section name. It can be left out on a router
@@ -249,29 +250,34 @@ wwandctl ipa m0 info
 
 - `poll` waits for a run already under way (a scheduled one) to end, then
   runs its own.
-- `reset` runs `ipad reset`: it deletes `device.key`, **every** `*.state` in
-  `/etc/wwand/ipa` and the binding markers. While a run holds the card it
-  waits for it, up to 120 s, then fails `busy`. The uci options stay, and so
+- `reset` runs `ipad reset <EID>` for this modem's card: it deletes that
+  card's `<EID>.state` in `/etc/wwand/ipa`, and nothing else. The device key
+  and the binding markers stay, because every modem on the router shares
+  them. The EID is the one the last run read; when none is known, an `info`
+  run reads it first. `reset --all` runs `ipad reset all`: it deletes
+  `device.key`, **every** `*.state` and the binding markers, for every modem
+  on the router at once; it is what a re-key and a refused binding need, and
+  it fails `busy` while any modem's run is under way. While a run holds the
+  card, `reset` waits for it, up to 120 s, then fails `busy`. The uci options stay, and so
   does the configuration file `ipa_eim_config` names (`<modem>-eim.ber` is
   not a state file). What the next poll does depends on that option:
   - **`ipa_eim_config` not set** (a bundle was used): polls fail
     (`no_eim_config`) until something new is provisioned.
   - **`ipa_eim_config` set:** the next poll — the schedule's, not only yours
     — finds no eIM (ipad exit 3) and the plugin provisions that **old** file
-    again, on its own: the old configuration with its old counter, and a
-    new device key the eIM does not know. So at a reset, replace the file
+    again, on its own: the old configuration with its old counter (and,
+    after `--all`, a new device key the eIM does not know). So at a reset, replace the file
     first (`wwandctl ipa m0 eim <file>` with a configuration at the counter
     you need, see [Re-keying](#re-keying-after-a-lost-device-key)), or remove
     the option (`uci delete network.m0.ipa_eim_config`, commit, `ubus call
     wwand reload`).
 
-  Because the directory is shared, a reset affects every modem on the
-  router. An IoT eUICC keeps its eIM configuration: only the eIM can remove
+  An IoT eUICC keeps its eIM configuration: only the eIM can remove
   it.
 
 Over ubus the same operations are `modem_plugin { modem, plugin: "ipa", op }`
 with `op` one of `status`, `poll` (returns once the run has started),
-`export { file }`, `provision { file }`, `info` and `reset`. The read-only
+`export { file }`, `provision { file }`, `info` and `reset { all }`. The read-only
 `modem_plugin_status` reaches `status` only.
 
 ## 7. Status and logs
@@ -367,7 +373,7 @@ explains how.
 | `busy` | an lpac operation or another run holds the card. `wwandctl ipa poll` waits for it |
 | `invalid_argument` (`ipa_eim_config`, `ipa_eim_id`, `file`) | a path or id with characters outside the allowed set |
 | `exit 1` + ipad's reason | see `logread -e ipad`: TLS, HTTP, the card |
-| `exit 4`, `bind: refused`, `wwandctl` exit 2 | the eIM refused the binding (403). Ask the eIM operator. Polling stays off until a new bundle is provisioned or `wwandctl ipa reset` |
+| `exit 4`, `bind: refused`, `wwandctl` exit 2 | the eIM refused the binding (403). Ask the eIM operator. Polling stays off until a new bundle is provisioned or `wwandctl ipa reset --all` (the refusal is the binding's, and the binding belongs to the shared device key) |
 | results never acknowledged (`results: 0`) | the eIM cannot verify the card's results: device key not imported, or replaced. Compare `key_fingerprint` with `eimctl euicc show <EID>` |
 | manual eSIM change refused `esim_managed` | the card is managed (`option ipa`). Pass `force` only if you accept that the eIM's view and the assistant's state (rollback target, pending results) go out of step |
 | `rolled back` in `last changes` | the new profile did not get a data session within 5 minutes, or the result could not reach the eIM over it. See [operation.md](operation.md#troubleshooting-rolled-back-although-the-profile-is-fine) |
@@ -397,7 +403,7 @@ ssh root@router 'cat > /tmp/cfg.der' < cfg.der
 # on the router — the file first: a reset while ipa_eim_config still names
 # the old one lets the next scheduled poll provision that one again
 wwandctl ipa m0 eim /tmp/cfg.der          # replaces /etc/wwand/ipa/m0-eim.ber
-wwandctl ipa m0 reset                     # key, state, binding gone
+wwandctl ipa m0 reset --all               # key, every state, binding gone
 ubus call wwand modem_plugin '{"modem":"m0","plugin":"ipa","op":"provision","args":{"file":"/etc/wwand/ipa/m0-eim.ber"}}'
 wwandctl ipa m0 export /tmp/device.json   # counter N+1, the new key
 ssh root@router cat /tmp/device.json > device.json
@@ -411,7 +417,8 @@ The `ubus` call stores the configuration without a poll; `wwandctl ipa m0
 poll` would do it too, but polls right after, and would then fetch a queued
 package before the import. With fleet management on, the schedule can still
 poll in between: queue nothing for the card on the eIM until the import is
-done. `reset` clears `/etc/wwand/ipa` for every modem on the router.
+done. `reset --all` clears `/etc/wwand/ipa` for every modem on the router:
+the other cards need the same re-keying.
 
 Not verified yet: a run on router hardware with an eUICC. The plugin is
 tested on the host, through wwand's real eSIM bridge with a stub assistant

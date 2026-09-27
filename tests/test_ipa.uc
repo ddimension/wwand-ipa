@@ -373,14 +373,15 @@ delete modem.slot_status;
 // --- connectivity, download, export --------------------------------------------
 
 {
-	let ups = [], dls = [], replies = [];
-	let dl_err = null;
+	let ups = [], dls = [], nts = [], replies = [];
+	let dl_err = null, nt_err = null;
 	let s2 = mk({
 		sim_upsert: (iccid, fields, origin, opts) => {
 			push(ups, [ iccid, fields, origin, opts ]);
 			return { written: true, section: 'wwsim_' + iccid };
 		},
 		download: (ref, code, cc, cb) => { push(dls, [ ref, code, cc ]); cb(dl_err); },
+		notify: (ref, seq, cb) => { push(nts, [ ref, seq ]); cb(nt_err); },
 	});
 	let ev = (event, payload) => (on_ipa, on_done) => {
 		on_ipa({ kind: 'event', event: event, payload: payload }, (obj) => {
@@ -434,6 +435,20 @@ delete modem.slot_status;
 	s2.poll('m1', cfg, () => null);
 	eq(replies, [ { ok: false, error: 'download_failed' } ], 'download: a failure too');
 	dl_err = null;
+
+	// the download's PIR goes to the SM-DP+ through the bridge (SGP.32 3.2.3.1
+	// step 14), with the sequence number the assistant names
+	replies = [];
+	script = ev('notify', { seq: 7 });
+	s2.poll('m1', cfg, () => null);
+	eq(nts, [ [ 'm1', 7 ] ], 'notify: the sequence number reaches the bridge');
+	eq(replies, [ { ok: true } ], 'notify: delivery is reported back');
+
+	nt_err = { error: 'notify_failed' };
+	replies = [];
+	s2.poll('m1', cfg, () => null);
+	eq(replies, [ { ok: false, error: 'notify_failed' } ], 'notify: and a failure, so the assistant keeps it');
+	nt_err = null;
 
 	// export: its own run with the file argument
 	runs = [];
@@ -509,17 +524,37 @@ delete modem.slot_status;
 	runs = [];
 	let rr = null;
 	s3.reset('m1', cfg, (e, r) => { rr = [ e, r ]; });
-	eq(rr, [ null, { reset: true } ], 'bundle: reset done');
-	eq(resets_run, [ "/x/ipad -s '/s' reset >/dev/null 2>&1" ], 'bundle: reset runs ipad reset on the state directory');
-	eq(length(runs), 0, 'bundle: reset needs no card session');
+	eq(rr, [ null, { reset: true, all: false } ], 'bundle: reset done');
+	eq(resets_run, [ sprintf("/x/ipad -s '/s' reset %s >/dev/null 2>&1", EID) ],
+		'bundle: reset runs ipad reset of THIS card only: the directory is shared with the other modems');
+	eq(length(runs), 0, 'bundle: reset needs no card session when the EID is known');
 	st = s3.status('m1', cfg);
 	eq([ st.eid, st.bind, st.key_fingerprint, st.last_poll ], [ null, null, null, null ], 'bundle: reset: the card is forgotten');
+
+	// the EID not known (forgotten just now): an info run reads it first
+	resets_run = [];
+	script = ev([ info_ev ]);
+	s3.reset('m1', cfg, (e, r) => { rr = [ e, r ]; });
+	eq(length(runs), 1, 'bundle: reset without a known EID: an info run first');
+	eq(resets_run, [ sprintf("/x/ipad -s '/s' reset %s >/dev/null 2>&1", EID) ], 'bundle: then the reset of the card it read');
+	eq(rr, [ null, { reset: true, all: false } ], 'bundle: reset after info done');
+
+	// --all: every card, the device key and the binding
+	resets_run = [];
+	runs = [];
+	s3.reset('m1', cfg, (e, r) => { rr = [ e, r ]; }, { all: true });
+	eq(resets_run, [ "/x/ipad -s '/s' reset all >/dev/null 2>&1" ], 'bundle: reset --all runs ipad reset all');
+	eq([ rr, length(runs) ], [ [ null, { reset: true, all: true } ], 0 ], 'bundle: reset --all needs no card and no EID');
 
 	// reset while a run holds the state: refused
 	script = (on_ipa, on_done) => { on_ipa({ kind: 'event', event: 'info', payload: {} }, () => null); return null; };
 	s3.poll('m1', cfg, () => null);
 	s3.reset('m1', cfg, (e, r) => { rr = [ e, r ]; });
 	eq(rr[0]?.error, 'busy', 'bundle: no reset under a running assistant');
+	// --all from another modem: it would pull the directory from under the run
+	rr = null;
+	s3.reset('m2', cfg, (e, r) => { rr = [ e, r ]; }, { all: true });
+	eq(rr[0]?.error, 'busy', 'bundle: no reset --all while any modem runs');
 	script = null;
 }
 

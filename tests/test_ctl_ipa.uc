@@ -56,7 +56,7 @@ eq(ctl.eim_config_kind('\x30\x0a\x02\x01\x00'), null, 'eim file: some other SEQU
 }
 
 
-ok(type(ctl.run) == 'function' && length(ctl.help) == 8, 'ctl: the shape wwandctl loads (run, help)');
+ok(type(ctl.run) == 'function' && length(ctl.help) == 9, 'ctl: the shape wwandctl loads (run, help)');
 
 // --- provision / poll / info / reset: the scripted commands --------------------
 // A fake daemon (ctx.call answers per op from a script) and a fake system
@@ -223,9 +223,14 @@ const INFO = { eid: 'E1', card_type: 'emulated', bind: 'pending', bound: false, 
 	e.uci.m1.ipa = '1';
 	eq(ctl.reset(e.ctx, 'm1', e.sys), 0, 'reset: exit 0');
 	eq(e.json(), { result: 'ok' }, 'reset: the JSON line');
+	eq(e.calls[0], [ 'modem_plugin', 'reset', { all: false } ], 'reset: of this card only, by default');
 	ok(index(join('', e.err), 'no_eim_config') >= 0, 'reset: says that polls fail until a new bundle comes');
 	e = mkenv({ reset: { ok: false, error: 'busy' } });
 	eq(ctl.reset(e.ctx, 'm1', e.sys), 1, 'reset: a card that stays busy is a failure');
+	e = mkenv({ reset: { ok: true, reset: true, all: true } });
+	eq(ctl.reset(e.ctx, 'm1', e.sys, true), 0, 'reset --all: exit 0');
+	eq(e.calls[0], [ 'modem_plugin', 'reset', { all: true } ], 'reset --all: asks the plugin for every card');
+	ok(index(join('', e.err), 'device key') >= 0, 'reset --all: says the device key went too');
 }
 
 done('test_ctl_ipa');
