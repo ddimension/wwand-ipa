@@ -20,6 +20,19 @@ implementation of SGP.32 v1.3 that the feed builds as `wwand-ipad`
 protocol, so wwand relays its APDUs over the modem's own channel through the
 same bridge lpac uses. It needs `wwand-esim`.
 
+**Documentation:**
+
+- [docs/howto.md](docs/howto.md): install, point a modem at the eIM,
+  provision, the schedule, `wwandctl ipa`, status and logs, the APN
+  write-back, troubleshooting;
+- [docs/operation.md](docs/operation.md): operation and setup. How a profile
+  switch travels through wwand, what rollback and fallback depend on
+  (getting the APN right *before* the switch), wwand's own mechanisms, and
+  checklists;
+- ipad's [SGP.22 emulation](https://github.com/ddimension/ipad/blob/main/docs/sgp22-emulation.md):
+  how an ordinary consumer eUICC is used for SGP.32, its state, the device
+  key and the trust model.
+
 ## What it does
 
 An **eIM** is the fleet side of SGP.32. The operator queues eUICC packages
