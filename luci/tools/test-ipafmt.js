@@ -53,7 +53,7 @@ eq(fmt.rows({ enabled: true, now: 7500, state: 'idle', runs: 1, profile_changes:
 eq(fmt.rows({ enabled: true, now: 0, state: 'idle', eid: 'E2', backend: 'iot',
               connectivity: { iccid: '8949', source: 'card', apn: 'iot.ex', pdp_type: 'ipv4', section: 'mysim', reason: 'foreign' } }).slice(2), [
 	[ 'Card', 'EID E2 · IoT eUICC' ],
-	[ 'Connectivity', '8949: APN iot.ex · ipv4 → your wwand_sim mysim wins, not touched' ],
+	[ 'Connectivity', '8949: APN iot.ex · ipv4 → left to your wwand_sim mysim' ],
 ], 'an IoT eUICC, and a hand-written wwand_sim that wins');
 eq(fmt.rows({ enabled: true, now: 0, state: 'idle', last_changes: { downloads: [ { ok: true }, { ok: false } ] } }).pop(),
    [ 'Last changes', 'downloaded · download failed' ], 'downloads the eIM asked for');

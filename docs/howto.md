@@ -54,7 +54,8 @@ eIM.
 The options belong to the modem's **`config wwand_modem`** section in
 `/etc/config/network`. A modem that still runs on an old-style configuration
 has no such section; migrate it first (LuCI, or `/usr/libexec/wwand/migrate`).
-`wwandctl ipa` refuses with that hint.
+`wwandctl ipa provision` and `wwandctl ipa eim` check for it and refuse with
+that hint; the other subcommands do not check.
 
 Pick the route that matches what the eIM operator gives you.
 
@@ -154,9 +155,9 @@ On the `wwand_modem` section:
 | Option | Default | |
 |---|---|---|
 | `ipa` | off | fleet management for this modem |
-| `ipa_eim_config` | – | the eIM configuration file for a card without an eIM (a path: letters, digits, `._/-`) |
+| `ipa_eim_config` | – | the eIM configuration file for a card without an eIM (an absolute path: letters, digits, `._/-`, no `..`) |
 | `ipa_eim_id` | the first | which eIM, when the card has several (`-e`) |
-| `ipa_interval` | 3600 | seconds between polls. Values below 300 become 300, and a value that is not a number gives the default |
+| `ipa_interval` | 3600 | seconds between polls. Values from 1 to 299 become 300; 0, a negative value or one that is not a number gives the default 3600 |
 | `ipa_backend` | `auto` | `iot` or `emu` to skip the probe |
 | `ipa_direct` | on | offer direct downloads (lpac) to the eIM (`-D`) |
 | `ipa_insecure` | off | no TLS verification of the eIM (`-k`), lab only |
@@ -229,7 +230,7 @@ stderr, and the exit status is:
 
 | Exit | |
 |---|---|
-| 0 | done (`poll`: the run completed and the eIM had no more packages) |
+| 0 | done (`poll`: the run completed — the eIM had no more packages, or ipad stopped after its cap of 16 packages in one run and the rest waits for the next poll) |
 | 1 | failed: the eIM or the network, the card, an argument (`error` says which) |
 | 2 | the eIM refused to bind the card (403) |
 | 3 | not supported here: ipad or wwand-esim not installed |
@@ -249,11 +250,24 @@ wwandctl ipa m0 info
 - `poll` waits for a run already under way (a scheduled one) to end, then
   runs its own.
 - `reset` runs `ipad reset`: it deletes `device.key`, **every** `*.state` in
-  `/etc/wwand/ipa` and the binding markers. It is refused while a run is under
-  way. The uci options stay, so with `option ipa` on, polls fail
-  (`no_eim_config`) until something new is provisioned. Because the directory
-  is shared, a reset affects every modem on the router. An IoT eUICC keeps its
-  eIM configuration: only the eIM can remove it.
+  `/etc/wwand/ipa` and the binding markers. While a run holds the card it
+  waits for it, up to 120 s, then fails `busy`. The uci options stay, and so
+  does the configuration file `ipa_eim_config` names (`<modem>-eim.ber` is
+  not a state file). What the next poll does depends on that option:
+  - **`ipa_eim_config` not set** (a bundle was used): polls fail
+    (`no_eim_config`) until something new is provisioned.
+  - **`ipa_eim_config` set:** the next poll — the schedule's, not only yours
+    — finds no eIM (ipad exit 3) and the plugin provisions that **old** file
+    again, on its own: the old configuration with its old counter, and a
+    new device key the eIM does not know. So at a reset, replace the file
+    first (`wwandctl ipa m0 eim <file>` with a configuration at the counter
+    you need, see [Re-keying](#re-keying-after-a-lost-device-key)), or remove
+    the option (`uci delete network.m0.ipa_eim_config`, commit, `ubus call
+    wwand reload`).
+
+  Because the directory is shared, a reset affects every modem on the
+  router. An IoT eUICC keeps its eIM configuration: only the eIM can remove
+  it.
 
 Over ubus the same operations are `modem_plugin { modem, plugin: "ipa", op }`
 with `op` one of `status`, `poll` (returns once the run has started),
@@ -323,9 +337,15 @@ config wwand_sim 'wwsim_89000123456789012342'
 - **The card states nothing:** this is always the case for an emulated SGP.22
   card. The section is **created** with the ICCID only, for you to fill in.
   Later polls never touch it again (`create_only`), so what you add stays.
-- **A hand-written `wwand_sim` for the same ICCID always wins.** Any section
-  without `origin 'ipa'` for that ICCID is left alone. The status reports
-  `foreign`: "your wwand_sim … wins, not touched".
+- **A hand-written `wwand_sim` for the same ICCID is never touched.** While
+  any section without `origin 'ipa'` exists for that ICCID, the plugin
+  neither creates nor updates `wwsim_<iccid>`, and the status reports
+  `foreign` ("left to your wwand_sim …"). That is only true of the
+  write-back, though: wwand itself uses the **first** `wwand_sim` whose ICCID
+  matches, in the order of `/etc/config/network`, and does not look at
+  `origin` (`match_sim_override`). A section you add *after* the plugin
+  wrote `wwsim_<iccid>` sits below it and loses. Then delete
+  `wwsim_<iccid>`, or take it over (below) instead of adding a second one.
 - **To take a written section over,** delete its `option origin` line.
 - A write reloads wwand's configuration without restarting the modem. The new
   values take effect at the **next card read** (the next SIM reset or modem
@@ -352,7 +372,46 @@ explains how.
 | manual eSIM change refused `esim_managed` | the card is managed (`option ipa`). Pass `force` only if you accept that the eIM's view and the assistant's state (rollback target, pending results) go out of step |
 | `rolled back` in `last changes` | the new profile did not get a data session within 5 minutes, or the result could not reach the eIM over it. See [operation.md](operation.md#troubleshooting-rolled-back-although-the-profile-is-fine) |
 | `connectivity … none stated (emulated: none)` | expected for an SGP.22 card. Fill in the created `wwsim_<iccid>` section, or pre-fill one ([operation.md](operation.md#getting-the-apn-right-before-the-switch)) |
-| lost device key | see ipad's [how-to](https://github.com/ddimension/ipad/blob/main/docs/howto.md#recover-from-a-lost-device-key): re-keying needs a counter above the eIM's |
+| lost device key | [Re-keying after a lost device key](#re-keying-after-a-lost-device-key), below |
+| lost `<EID>.state`, key intact | the card has no eIM (`no_eim_config`, or the file of `ipa_eim_config` is provisioned again). Provision a configuration at the eIM's counter **N** itself (`eimctl euicc show <EID>`), not N+1: the eIM's next package carries N+1, and the emulation refuses counters `<=` its own. No re-key |
+
+### Re-keying after a lost device key
+
+An emulated card whose `device.key` is gone needs its new key imported on the
+eIM with `eimctl euicc import --replace-key`, and the eIM takes it only from
+an import file whose counter is **strictly above** its own counter N for the
+card. `export` writes the emulation's counter, so the emulation has to start
+at N+1. The import has to come **before the card fetches its next package**:
+that package would carry N+1, which the emulation refuses (its counter is
+N+1 already), and would leave the eIM at N+1, so the import would be refused
+as well. After the import the eIM stands at N+1 and its next package
+carries N+2. The counter rules are ipad's
+([how-to](https://github.com/ddimension/ipad/blob/main/docs/howto.md#recover-from-a-lost-device-key)).
+
+```sh
+# on the eIM
+eimctl euicc show <EID>                                    # its counter N
+eimctl eim-config cfg.der --fqdn eim.example.com --counter <N+1>
+ssh root@router 'cat > /tmp/cfg.der' < cfg.der
+
+# on the router — the file first: a reset while ipa_eim_config still names
+# the old one lets the next scheduled poll provision that one again
+wwandctl ipa m0 eim /tmp/cfg.der          # replaces /etc/wwand/ipa/m0-eim.ber
+wwandctl ipa m0 reset                     # key, state, binding gone
+ubus call wwand modem_plugin '{"modem":"m0","plugin":"ipa","op":"provision","args":{"file":"/etc/wwand/ipa/m0-eim.ber"}}'
+wwandctl ipa m0 export /tmp/device.json   # counter N+1, the new key
+ssh root@router cat /tmp/device.json > device.json
+
+# on the eIM, then the first poll
+eimctl euicc import device.json --replace-key
+ssh root@router wwandctl ipa m0 poll
+```
+
+The `ubus` call stores the configuration without a poll; `wwandctl ipa m0
+poll` would do it too, but polls right after, and would then fetch a queued
+package before the import. With fleet management on, the schedule can still
+poll in between: queue nothing for the card on the eIM until the import is
+done. `reset` clears `/etc/wwand/ipa` for every modem on the router.
 
 Not verified yet: a run on router hardware with an eUICC. The plugin is
 tested on the host, through wwand's real eSIM bridge with a stub assistant

@@ -60,7 +60,7 @@ return baseclass.extend({
 			var what = (cn.source == 'card')
 				? _('APN %s').format(cn.apn || _('(empty)')) + (cn.pdp_type ? ' · ' + cn.pdp_type : '')
 				: _('none stated (%s)').format(cn.source || 'none');
-			var where = (cn.reason == 'foreign') ? _('your wwand_sim %s wins, not touched').format(cn.section)
+			var where = (cn.reason == 'foreign') ? _('left to your wwand_sim %s').format(cn.section)
 				: (cn.reason == 'exists') ? _('%s kept as it is').format(cn.section)
 				: cn.section ? cn.section + (cn.written ? ' ' + _('(written)') : '')
 				: _('not written');

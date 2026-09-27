@@ -72,7 +72,7 @@ function ipa_lines(st, now)
 		let what = (cn.source == 'card')
 			? sprintf('apn %s%s', cn.apn ?? '(empty)', cn.pdp_type ? sprintf(' · %s', cn.pdp_type) : '')
 			: sprintf('none stated (%s)', cn.source ?? 'none');
-		let where = (cn.reason == 'foreign') ? sprintf('your wwand_sim %s wins, not touched', cn.section)
+		let where = (cn.reason == 'foreign') ? sprintf('left to your wwand_sim %s', cn.section)
 			: (cn.reason == 'exists') ? sprintf('%s kept as it is', cn.section)
 			: cn.section ? sprintf('%s%s', cn.section, cn.written ? ' (written)' : '')
 			: 'not written';

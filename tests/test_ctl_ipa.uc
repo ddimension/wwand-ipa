@@ -52,7 +52,7 @@ eq(ctl.eim_config_kind('\x30\x0a\x02\x01\x00'), null, 'eim file: some other SEQU
 	eq(cn({ iccid: '8949', source: 'card', apn: 'iot.ex', pdp_type: 'ipv4', section: 'wwsim_8949', written: true }),
 	   [ 'connectivity', '8949: apn iot.ex · ipv4 → wwsim_8949 (written)' ], 'connectivity: what the card stated, and where it went');
 	eq(cn({ iccid: '8949', source: 'card', apn: 'iot.ex', section: 'mysim', reason: 'foreign' }),
-	   [ 'connectivity', '8949: apn iot.ex → your wwand_sim mysim wins, not touched' ], 'connectivity: a hand-written section wins');
+	   [ 'connectivity', '8949: apn iot.ex → left to your wwand_sim mysim' ], 'connectivity: a hand-written section is left alone');
 }
 
 

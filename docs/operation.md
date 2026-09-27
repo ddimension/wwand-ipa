@@ -40,9 +40,11 @@ yet.
 3. ipad sees that the enabled ICCID changed and sends wwand the event
    `profile_changed`.
 4. The plugin (`on_profile_changed`) resets the SIM through
-   `esim_bridge.apply_sim_reset` → `sim.power_cycle`. That tries QMI UIM
-   power off/on (native, or over the MBIM passthrough), then MBIM UICC Reset,
-   then AT `CFUN=0/1`.
+   `esim_bridge.apply_sim_reset` → `sim.power_cycle`. That picks ONE path by
+   what the modem has: QMI UIM power off/on where there is a UIM client
+   (native, or over the MBIM passthrough); otherwise MBIM UICC Reset, and AT
+   `CFUN=0/1` if that fails or is not there. A failing QMI UIM power cycle
+   does not go on to MBIM or AT.
    - If the power cycle fails, the apply falls back to `modem_reset`, and the
      plugin calls the daemon's modem reset itself, because nobody would press
      the button in LuCI.
@@ -83,7 +85,7 @@ sequenceDiagram
     I->>U: LoadEuiccPackage → EnableProfile B (refreshFlag FALSE)
     I->>P: event profile_changed (B)
     P->>B: apply_sim_reset(slot)
-    B->>M: power_cycle: QMI UIM off/on → MBIM UICC Reset → AT CFUN 0/1
+    B->>M: power_cycle: QMI UIM off/on, or else MBIM UICC Reset → AT CFUN 0/1
     alt power cycle failed
         B-->>P: apply = modem_reset
         P->>D: modem_reset
@@ -191,9 +193,13 @@ for eIM switches:
 - **Autosetup only.** It is used only when wwand created the configuration
   itself (no `wwand_modem` and no `proto wwand` interface existed) and the
   interface still carries `option autosetup '1'`.
-- **Once.** The values are copied into the **interface**, and the marker is
-  removed. From then on the table is never consulted again, including for
-  profiles the eIM enables later.
+- **Once, when it matches.** On a match the values are copied into the
+  **interface** and the marker is removed; from then on the table is never
+  consulted again, including for profiles the eIM enables later. Without a
+  match (or when the card's own APN wins, below) the marker stays, and the
+  table is looked at again at the first registration after the next wwand
+  start — once per interface per daemon run, not at a profile switch within
+  a run.
 - **Only when the card provisions nothing.** A card-provisioned attach APN
   wins, and a backend that did not report one skips the table.
 - **It writes the interface, not a per-ICCID entry.** The copied APN becomes
@@ -229,9 +235,13 @@ config wwand_sim 'fleet_opB'
   modem's reload signature. The list is handed to the running modem, and the
   section takes effect at the next card read, which after a switch is the
   SIM reset in step 5.
-- A hand-written section (without `origin 'ipa'`) always wins over the
-  plugin's write-back. The plugin never touches it and reports it as
-  `foreign`.
+- The plugin never touches a hand-written section (without `origin 'ipa'`),
+  and while one exists for the ICCID it neither creates nor updates
+  `wwsim_<iccid>`; it reports it as `foreign`. wwand, however, uses the
+  **first** matching `wwand_sim` in `/etc/config/network` order, whatever
+  its `origin` (`match_sim_override`): a hand-written section added after
+  the plugin wrote `wwsim_<iccid>` comes second and is not used. Delete
+  `wwsim_<iccid>` then, or make it yours (next point).
 - If the plugin created `wwsim_<iccid>` first (emulated card: ICCID only),
   fill in that section, or delete its `origin` line to make it yours.
 - A `wwand_sim` can also carry `pincode`. On an eSIM profile that is rarely
@@ -368,7 +378,7 @@ In the order to check them:
 | **Wrong `pdp_type`** (e.g. `ipv4v6` on an IPv4-only subscription) | activation refused, or connected without the expected family | `option pdp_type` in the `wwand_sim` |
 | **The eIM is not reachable over the new profile** | the plugin logged "connection back after the profile change", yet ipad rolled back ("profile rolled back to …") | a route or APN that reaches the eIM from that profile |
 | **The new profile needs longer than 5 minutes** (first registration on a new network, a slow modem reset) | "connection NOT back after the profile change" with a session appearing afterwards | fix the cause of the delay. The window itself is fixed in the code |
-| **The SIM reset did not take** | "SIM reset failed" / "the SIM could not be reset — resetting the modem", and the modem kept the old ICCID | check the modem's APDU backend (`sim.apdu_backend`) and its REFRESH/reset behaviour |
+| **The SIM reset did not take** | "eSIM apply: sim power-cycle failed (…) — modem reset needed" and "the SIM could not be reset — resetting the modem" ("SIM reset failed" only when wwand-esim is missing), and the modem kept the old ICCID | check the modem's APDU backend (`sim.apdu_backend`) and its REFRESH/reset behaviour |
 | **The recovery ladder fired during the window** | recovery rung lines around the switch | usually a consequence of one of the causes above |
 
 A rollback needs `rollbackFlag`. Without it the card stays on the new

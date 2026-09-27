@@ -61,8 +61,11 @@ fetches and runs them. What the host adds:
   	option pdp_type 'ipv4v6'
   ```
 
-  - **A hand-written `wwand_sim` for the same card always wins.** It is never
-    touched.
+  - **A hand-written `wwand_sim` for the same card is never touched,** and
+    while one exists the plugin writes none of its own. wwand uses the
+    first matching `wwand_sim` in `/etc/config/network` order, whatever its
+    `origin`: one added after the plugin's `wwsim_<iccid>` is not used —
+    delete that one, or take it over.
   - **Taking the section over:** delete its `origin` line.
   - **A card that states no parameters still gets its section.** That is
     always the case for an emulated SGP.22 card (below). The section is
@@ -157,9 +160,9 @@ to another eIM is the eIM's business (SGP.32 `addEim` / `updateEim`).
 | Option | Default | |
 |---|---|---|
 | `ipa` | off | fleet management for this modem |
-| `ipa_eim_config` | – | the eIM configuration file for a card without an eIM |
+| `ipa_eim_config` | – | the eIM configuration file for a card without an eIM (an absolute path, no `..`) |
 | `ipa_eim_id` | the first | which eIM, when the card has several |
-| `ipa_interval` | 3600 | seconds between polls (at least 300) |
+| `ipa_interval` | 3600 | seconds between polls (at least 300; 0, negative or not a number: 3600) |
 | `ipa_backend` | `auto` | `iot` / `emu` to skip the probe |
 | `ipa_direct` | on | offer direct downloads (lpac) to the eIM |
 | `ipa_insecure` | off | no TLS verification of the eIM — lab only |
@@ -212,7 +215,7 @@ messages for people go to stderr, and the exit status is
 
 | Exit | |
 |---|---|
-| 0 | done (`poll`: the run completed, the eIM had no more packages) |
+| 0 | done (`poll`: the run completed — the eIM had no more packages, or ipad's cap of 16 packages per run was reached) |
 | 1 | failed: the eIM or the network, the card, an argument; `error` says which |
 | 2 | the eIM refused to bind the card (403) |
 | 3 | not supported here: ipad or wwand-esim not installed |
@@ -228,10 +231,14 @@ messages for people go to stderr, and the exit status is
 - `provision` answers like `info`, plus `bundle_deleted`, or with
   `bundle_kept` when the bundle could not be stored.
 - `reset` removes the eIM configuration of the emulation, its state, the
-  device key and the binding (`ipad reset`, no card needed), refused while a
-  run is under way. The uci options stay: with `option ipa` on, polls then
-  fail (`no_eim_config`) until a new bundle is provisioned. An IoT eUICC keeps
-  its eIM configuration; only the eIM can remove it.
+  device key and the binding (`ipad reset`, no card needed); while a run
+  holds the card it waits up to 120 s. The uci options stay: with `option
+  ipa` on and no `ipa_eim_config`, polls then fail (`no_eim_config`) until
+  something new is provisioned; **with `ipa_eim_config` set, the next poll
+  provisions that file again** — the old configuration, its old counter, and
+  a new key the eIM does not know. Replace the file (`wwandctl ipa eim`) or
+  remove the option at the reset ([how-to](docs/howto.md#re-keying-after-a-lost-device-key)).
+  An IoT eUICC keeps its eIM configuration; only the eIM can remove it.
 
 **ubus:** `modem_plugin { modem, plugin: "ipa", op }`, with these ops:
 
