@@ -868,17 +868,29 @@ return {
 	name: 'ipa',
 	options: OPTIONS,
 
-	create: function(pd) {
-		// the daemon's deps, looked up when used: the eSIM bridge and module
-		// load lazily in the daemon, and wwand-esim may be missing entirely
-		let bridge = {
-			session_run: (...a) => pd.esim_bridge()?.session_run(...a) ?? { error: 'esim_not_installed' },
+	// the eSIM bridge as the scheduler uses it, looked up when used: the
+	// daemon loads it lazily, and wwand-esim may be missing entirely
+	bridge_of: function(pd) {
+		return {
+			// session_run answers null when the run STARTED, an error object
+			// when it did not: `?? { error }` turned every successful start
+			// into esim_not_installed, and the caller reported a failed run
+			// while ipad was running (HW-seen on 245, 2026-09-28)
+			session_run: (...a) => {
+				let br = pd.esim_bridge();
+
+				return br ? br.session_run(...a) : { error: 'esim_not_installed' };
+			},
 			apply_sim_reset: (ref, slot, cb) => {
 				let br = pd.esim_bridge();
 
 				return br ? br.apply_sim_reset(ref, slot, cb) : cb({ error: 'esim_not_installed' });
 			},
 		};
+	},
+
+	create: function(pd) {
+		let bridge = this.bridge_of(pd);
 
 		let sch = this.scheduler({
 			bridge: bridge,

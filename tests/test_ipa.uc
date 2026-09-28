@@ -651,4 +651,25 @@ eq(pres?.error, 'ipa_disabled', 'plugin: a poll without option ipa is refused');
 pl.ops.status('m0', { ipa: '1' }, {}, (e, r) => { pres = r; });
 eq(pres?.enabled, true, 'plugin: status reads the typed options');
 
+// THE ADAPTER THE SCHEDULER SEES (bridge_of). session_run answers null when
+// the run started: an adapter that read null as "no bridge" reported every
+// run as esim_not_installed while ipad ran (HW-seen on 245, 2026-09-28).
+{
+	let started = 0, have = true;
+	let br = ipa.bridge_of({ esim_bridge: () => have ? {
+		session_run: () => { started++; return null; },
+		apply_sim_reset: (ref, slot, cb) => cb(null, { reset: 'sim' }),
+	} : null });
+
+	eq([ br.session_run('m0', 1, 'ipa', 'poll', 'info', () => null, () => null), started ], [ null, 1 ],
+	   'adapter: a started run is no error');
+	have = false;
+	eq(br.session_run('m0', 1, 'ipa', 'poll')?.error, 'esim_not_installed', 'adapter: no bridge is');
+
+	let r = null;
+
+	br.apply_sim_reset('m0', 1, (e) => { r = e; });
+	eq(r?.error, 'esim_not_installed', 'adapter: nor a SIM reset without it');
+}
+
 done('test_ipa');
