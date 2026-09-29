@@ -64,6 +64,23 @@ eq(ipa.build_cmd({ ipad: '/x/ipad', dir: '/s', backend: 'auto' }), "/x/ipad -s '
 	'cmd: auto is the assistant\'s default, not passed');
 eq(ipa.log_level('ipad: -r wants 6 hex digits'), 'notice', 'log: what reaches the pipe is worth seeing');
 
+// rPLMN, TS 24.008 §10.5.1.3: MCC2|MCC1, MNC3|MCC3, MNC2|MNC1, F for a 2-digit MNC
+let reg = (mcc, mnc, d, r) => ({ registration: r ?? 1, plmn: { mcc: mcc, mnc: mnc, mnc_digits: d } });
+eq(ipa.rplmn_of(reg(262, 1, 2)), '62F210', 'rplmn: 262/01');
+eq(ipa.rplmn_of(reg(262, 2, 2)), '62F220', 'rplmn: 262/02');
+eq(ipa.rplmn_of(reg(310, 410, 3)), '130014', 'rplmn: 310/410, a three-digit MNC');
+eq(ipa.rplmn_of(reg(310, 30, 3)), '130030', 'rplmn: 310/030 keeps its leading zero');
+eq(ipa.rplmn_of(reg(1, 1, 2)), '00F110', 'rplmn: the 001/01 test network');
+eq(ipa.rplmn_of(reg(310, 410, null)), '130014', 'rplmn: an MNC of 100 or more needs no width');
+eq(ipa.rplmn_of(reg(262, 1, null)), null, 'rplmn: an MNC width that is not known is not guessed');
+eq(ipa.rplmn_of(reg(262, 1, 2, 0)), null, 'rplmn: not registered, none');
+eq(ipa.rplmn_of({ registration: 1 }), null, 'rplmn: registered without a PLMN, none');
+eq(ipa.rplmn_of(null), null, 'rplmn: no registration at all, none');
+eq(ipa.build_cmd({ ipad: '/x/ipad', dir: '/s', rplmn: '62F210' }),
+	"/x/ipad -s '/s' -r 62F210 poll 2>&1", 'cmd: the rPLMN goes along');
+eq(ipa.build_cmd({ ipad: '/x/ipad', dir: '/s', rplmn: "62F210'; x" }),
+	"/x/ipad -s '/s' poll 2>&1", 'cmd: anything but six hex digits never reaches the shell line');
+
 // --- the scheduler against a fake bridge ---------------------------------------
 
 const EID = '89049032123451234512345678901235';
@@ -104,7 +121,8 @@ let bridge = {
 	apply_sim_reset: (ref, slot, cb) => { resets++; cb(null, reset_res); },
 };
 
-let modem = { info: { imei: '351234567890123' } };
+let modem = { info: { imei: '351234567890123' },
+              reg: { registration: 1, plmn: { mcc: 262, mnc: 1, mnc_digits: 2 } } };
 
 let mk = (over) => ipa.scheduler({
 	bridge: bridge,
@@ -161,6 +179,7 @@ ok(index(runs[0], ' poll ') >= 0 && index(runs[2], ' poll ') >= 0, 'provision: t
 ok(index(runs[0], "-s '/s'") >= 0, 'provision: the state directory is passed');
 ok(index(runs[0], '-i 351234567890123') >= 0, 'provision: the modem\'s IMEI for DeviceInfo');
 ok(index(runs[0], ' -D ') >= 0, 'provision: direct download offered by default');
+ok(index(runs[0], ' -r 62F210 ') >= 0, 'poll: the registered PLMN goes to the eIM (rPLMN)');
 eq(s.status('m1', cfg).last_ok, true, 'provision: the run counts as good');
 
 eq(refreshes[length(refreshes) - 1], [ 'm1', EID, 1 ], 'refresh: the profile list is read again after a run that reached the card');

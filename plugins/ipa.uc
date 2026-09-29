@@ -174,11 +174,44 @@ function due(st, cfg, timing)
 	return st.last_end + ((back < iv) ? back : iv);
 }
 
+// The PLMN the modem is registered on, as GetEimPackageRequest.rPLMN wants it
+// (SGP.32 SGP32Definitions.asn: OCTET STRING (SIZE(3)), TS 24.008 coding):
+// §10.5.1.3 packs MCC digit 2|1, MNC digit 3|MCC digit 3, MNC digit 2|1, one
+// digit per nibble, and a two-digit MNC puts F where its third digit would be
+// — 262/01 -> 62F210, 310/410 -> 130014. Hex, or null: not registered, no
+// MCC/MNC, or an MNC whose width is not known (01 and 001 are different
+// operators, and a guess would report the wrong one). Never a stale value:
+// it is read from the registration of THIS run.
+function rplmn_of(reg)
+{
+	let p = reg?.plmn;
+
+	if (+(reg?.registration ?? 0) != 1 || p == null || type(p.mcc) != 'int' || type(p.mnc) != 'int')
+		return null;
+
+	if (p.mcc < 0 || p.mcc > 999 || p.mnc < 0 || p.mnc > 999)
+		return null;
+
+	let w = (p.mnc_digits == 2 || p.mnc_digits == 3) ? p.mnc_digits
+	      : (p.mnc >= 100) ? 3 : null;
+
+	if (w == null || (w == 2 && p.mnc > 99))
+		return null;
+
+	let mcc = sprintf('%03d', p.mcc);
+	let mnc = (w == 3) ? sprintf('%03d', p.mnc) : sprintf('%02d', p.mnc) + 'F';
+
+	return substr(mcc, 1, 1) + substr(mcc, 0, 1) +
+	       substr(mnc, 2, 1) + substr(mcc, 2, 1) +
+	       substr(mnc, 1, 1) + substr(mnc, 0, 1);
+}
+
 // The assistant's command line: ipad [options] <cmd> [file].
 //   -s  its state directory (emulation state per EID, the device key)
 //   -b  backend, -e eIM id, -k no TLS verification (lab only), -i IMEI,
 //   -D  offer direct download (the `download` event goes to lpac, and so
 //       does the `notify` event with the download's PIR for the SM-DP+)
+//   -r  the registered PLMN (rplmn_of), for the eIM's GetEimPackage record
 // Its log goes to the syslog itself; stderr (usage errors, nothing else
 // without -v) joins the protocol pipe, 2>&1, where the bridge logs every line
 // that is not protocol JSON.
@@ -200,6 +233,10 @@ function build_cmd(o)
 
 	if (o.direct)
 		push(parts, '-D');
+
+	// hex digits and F only: rplmn_of builds it, but this is a shell line
+	if (o.rplmn && match(o.rplmn, /^[0-9A-F]{6}$/))
+		push(parts, '-r', o.rplmn);
 
 	push(parts, o.cmd ?? 'poll');
 
@@ -223,6 +260,7 @@ return {
 	interval_of: interval_of,
 	due: due,
 	build_cmd: build_cmd,
+	rplmn_of: rplmn_of,
 	log_level: log_level,
 
 	// The scheduler proper, on typed options (cfg_of) and direct deps:
@@ -612,6 +650,7 @@ return {
 						insecure: !!cfg?.ipa_insecure,
 						imei: imei_of(entry.modem.info?.imei),
 						direct: cfg?.ipa_direct !== false,
+						rplmn: rplmn_of(entry.modem.reg),
 						cmd: (phase == 'provision') ? 'provision' : (job?.cmd ?? 'poll'),
 						file: (phase == 'provision') ? init_cfg : job?.file,
 					});
