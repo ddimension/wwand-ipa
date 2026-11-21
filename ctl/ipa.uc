@@ -28,6 +28,23 @@ function span(sec)
 	return m ? sprintf('%d h %d min', h, m) : sprintf('%d h', h);
 }
 
+// One eIM configuration of the card ({ id, fqdn, tls }, the assistant's info
+// event) as text: what it is called, where it is, how its TLS is trusted.
+const TLS_TEXT = { key: 'TLS: pinned key', certificate: 'TLS: pinned certificate',
+                   configuration: 'TLS: from the configuration', system: 'TLS: system CAs' };
+
+function eim_text(e)
+{
+	let parts = [ e?.id ?? '(no id)' ];
+
+	push(parts, e?.fqdn ?? 'no FQDN (not polled)');
+
+	if (e?.tls)
+		push(parts, TLS_TEXT[e.tls] ?? sprintf('TLS: %s', e.tls));
+
+	return join(' · ', parts);
+}
+
 // `wwandctl ipa`: the eIM poll state (ubus modem_ipa status) as lines of
 // [ label, text ]. `now` is the daemon's clock, which the timestamps come
 // from (time(), seconds). What an operator asks first is "did it work, and
@@ -64,6 +81,15 @@ function ipa_lines(st, now)
 			: (st.backend == 'iot') ? ' · IoT eUICC' : '';
 
 		push(out, [ 'card', sprintf('EID %s%s', st.eid, how) ]);
+	}
+
+	// the eIM configurations on the card, as the last run read them
+	if (type(st.eims) == 'array') {
+		if (!length(st.eims))
+			push(out, [ 'eIM config', 'none on the card' ]);
+
+		for (let e in st.eims)
+			push(out, [ 'eIM config', eim_text(e) ]);
 	}
 
 	let cn = st.connectivity;
@@ -212,7 +238,7 @@ function is_bundle(head)
 // what the plugin's info answers, as the JSON line (the driver's `info`)
 let info_line = (r) => ({
 	eid: r?.eid, card_type: r?.card_type, bound: r?.bound, bind: r?.bind, counter: r?.counter,
-	key_fingerprint: r?.key_fingerprint, last_poll: r?.last_poll, last_error: r?.last_error,
+	key_fingerprint: r?.key_fingerprint, eims: r?.eims, last_poll: r?.last_poll, last_error: r?.last_error,
 });
 
 // `ipa <modem> provision <bundle>`: the assistant stores the eIM configuration
@@ -368,6 +394,33 @@ function info(ctx, modem, sys)
 	return (r?.ok === false) ? fail(sys, r) : emit(sys, info_line(r), EXIT_OK);
 }
 
+// `ipa <modem> eim-save <file>`: the card's eIM configurations as it holds
+// them, a GetEimConfigurationDataResponse (DER) — what `ipa eim` takes on
+// another card. The daemon writes it, so the path is made absolute here.
+function eim_save(ctx, modem, args, sys)
+{
+	sys = sys_of(sys);
+
+	let file = args[0] ?? '';
+
+	if (!length(file)) {
+		sys.err('usage: wwandctl ipa [modem] eim-save <file>\n');
+		return emit(sys, { result: 'error', error: 'usage' }, EXIT_FAIL);
+	}
+
+	if (substr(file, 0, 1) != '/')
+		file = sprintf('%s/%s', fs.getcwd(), file);
+
+	let r = op_wait(ctx, modem, 'eim_save', { file: file }, sys.now() + 120, sys);
+
+	if (r?.ok === false)
+		return fail(sys, (r.detail == 'no_eim') ? { error: 'no_eim', detail: 'the card holds no eIM configuration' } : r);
+
+	sys.err(sprintf('%s written — on another card: wwandctl ipa <modem> eim %s\n', r?.file ?? file, r?.file ?? file));
+
+	return emit(sys, { result: 'ok', file: r?.file ?? file, eims: r?.eims }, EXIT_OK);
+}
+
 // `ipa <modem> reset [--all]`: forget this modem's card in the emulation (its
 // eIM configuration and state); with --all every card's, the device key and
 // the binding, which the state directory holds for every modem on the router.
@@ -457,6 +510,8 @@ return {
 	poll_wait: poll_wait,
 	info: info,
 	reset: reset,
+	eim_save: eim_save,
+	eim_text: eim_text,
 
 	help: [
 		'ipa [modem] [status]                  eIM fleet management: state, schedule, the card',
@@ -465,7 +520,8 @@ return {
 		'ipa [modem] provision <bundle>        store an eIM bundle (eim-ipad-provision/1) and enable; JSON result',
 		'ipa [modem] poll [--timeout S]        poll now, wait for the end of the run (default 300 s); JSON result',
 		'ipa [modem] poll --no-wait            only start the poll',
-		'ipa [modem] info                      the card now: EID, device key, binding, counter; JSON',
+		'ipa [modem] info                      the card now: EID, eIMs, device key, binding, counter; JSON',
+		'ipa [modem] eim-save <file>           the card\'s eIM configurations as it holds them (DER, for `eim`); JSON',
 		'ipa [modem] reset                     forget the eIM configuration and state of this card; JSON result',
 		'ipa [modem] reset --all               the same for every card, plus device key and binding; JSON result',
 	],
@@ -501,6 +557,9 @@ return {
 		case 'info':
 			exit(info(ctx, r.modem));
 
+		case 'eim-save':
+			exit(eim_save(ctx, r.modem, slice(rest, 1)));
+
 		case 'reset': {
 			let extra = slice(rest, 1);
 
@@ -534,7 +593,7 @@ return {
 		}
 
 		default:
-			die('usage: wwandctl ipa [modem] [status|poll [--timeout S|--no-wait]|eim <file>|export <file>|provision <bundle>|info|reset [--all]]');
+			die('usage: wwandctl ipa [modem] [status|poll [--timeout S|--no-wait]|eim <file>|eim-save <file>|export <file>|provision <bundle>|info|reset [--all]]');
 		}
 	},
 };

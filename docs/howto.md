@@ -114,6 +114,10 @@ config wwand_modem 'm0'
 	option ipa_eim_config '/etc/wwand/ipa/m0-eim.ber'
 ```
 
+An IoT eUICC that already holds an eIM configuration needs none of this:
+`option ipa '1'` alone, and ipad uses what the card holds (it reads it at
+every run; `wwandctl ipa` shows it as `eIM config`).
+
 The file reaches the card only while the card has **no eIM yet**. ipad exits
 3 ("no eIM configured") on the first poll, and the plugin then runs `ipad
 provision <file>` and polls. A card that already has an eIM keeps it. Moving
@@ -218,6 +222,7 @@ wwandctl ipa [modem] eim <file>         # set the eIM configuration, enable
 wwandctl ipa [modem] export <file>      # the eIM import file (emulated card)
 wwandctl ipa [modem] provision <bundle> # store a bundle, enable (JSON)
 wwandctl ipa [modem] info               # the card now (JSON)
+wwandctl ipa [modem] eim-save <file>    # the card's eIM configuration, as it holds it (JSON)
 wwandctl ipa [modem] reset              # forget this card's configuration and state (JSON)
 wwandctl ipa [modem] reset --all        # every card's, plus the device key and binding (JSON)
 ```
@@ -225,7 +230,7 @@ wwandctl ipa [modem] reset --all        # every card's, plus the device key and 
 `[modem]` is the `wwand_modem` section name. It can be left out on a router
 with one modem.
 
-`provision`, `poll`, `info` and `reset` are meant for scripts as well. They
+`provision`, `poll`, `info`, `eim-save` and `reset` are meant for scripts as well. They
 print one JSON object as the last line on stdout, messages for people go to
 stderr, and the exit status is:
 
@@ -245,8 +250,23 @@ wwandctl ipa m0 poll --timeout 600
 
 # what the router has on this card
 wwandctl ipa m0 info
-# {"eid":"8904…","card_type":"emulated","bound":true,"bind":"done","counter":7,"key_fingerprint":"3F2A…","last_poll":1790000000,"last_error":null}
+# {"eid":"8904…","card_type":"emulated","bound":true,"bind":"done","counter":7,"key_fingerprint":"3F2A…","eims":[{"id":"eim.example","fqdn":"eim.example","tls":"certificate"}],"last_poll":1790000000,"last_error":null}
+
+# the eIM configuration this card holds, for another card
+wwandctl ipa m0 eim-save /tmp/m0-eim.ber
+# {"result":"ok","file":"/tmp/m0-eim.ber","eims":[{"id":"eim.example","fqdn":"eim.example","tls":"certificate"}]}
 ```
+
+- `eim-save` writes the card's `GetEimConfigurationDataResponse` (`BF55`,
+  DER, 0600) as the card answered it: the eIM's id, FQDN, keys and TLS trust,
+  and the associationToken this card generated, but no counter (a card never
+  reveals it). `wwandctl ipa <modem> eim <file>` takes it on another card,
+  which asks for an associationToken of its own, picks its own CI key
+  (`euiccCiPKId` is left out) and starts at counter 0 — the eIM must expect
+  that card at 0. A card may leave the eIM's key out of its answer; such a
+  file sets up no card, and provisioning it fails with `the card did not
+  return its key`. A card without an eIM: exit 1, `the
+  card holds no eIM configuration`, no file.
 
 - `poll` waits for a run already under way (a scheduled one) to end, then
   runs its own.
@@ -277,7 +297,7 @@ wwandctl ipa m0 info
 
 Over ubus the same operations are `modem_plugin { modem, plugin: "ipa", op }`
 with `op` one of `status`, `poll` (returns once the run has started),
-`export { file }`, `provision { file }`, `info` and `reset { all }`. The read-only
+`export { file }`, `provision { file }`, `info`, `eim_save { file }` and `reset { all }`. The read-only
 `modem_plugin_status` reaches `status` only.
 
 ## 7. Status and logs
@@ -289,6 +309,7 @@ eIM          idle · 12 runs · 1 profile change
 last run     4 min ago · ok
 next poll    in 56 min
 card         EID 89049032… · SGP.22 card, emulated · device key 3F2A9C0B11D4E7A2…
+eIM config   eim.example · eim.example · TLS: pinned certificate
 connectivity 8949…: none stated (emulated: none) → wwsim_8949… kept as it is
 last changes switched 8949…01 → 8949…02
 ```
@@ -300,6 +321,8 @@ through `modem_plugin_status` and polls through `modem_plugin`.
 **`ubus call wwand modem_plugin_status '{"modem":"m0","plugin":"ipa","op":"status"}'`**
 returns the full record: `state` (`idle`, `running`, `waiting_online`,
 `downloading`), `eid`, `backend`, `key_fingerprint`, `bind`, `counter`,
+`eims` (the card's eIM configurations, `[{ id, fqdn, tls }]`, as the last run
+read them),
 `last_poll` (with ipad's own summary: packages, acknowledged results, exit
 code, error), `runs`, `profile_changes`, `last_*`, `fails`, `next_due`,
 `interval`, `last_changes` (switches with a `rollback` flag, installs,

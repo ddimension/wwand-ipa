@@ -206,6 +206,23 @@ function rplmn_of(reg)
 	       substr(mnc, 1, 1) + substr(mnc, 0, 1);
 }
 
+// The eIM configurations the card holds, as the assistant's info event lists
+// them (GetEimConfigurationData: id, FQDN, how its TLS is trusted): the card's
+// own word, so only strings are kept, and no more entries than a card holds.
+// null: not said (an older assistant, a card that did not answer); []: none.
+const MAX_EIMS = 8;
+
+function eims_of(v)
+{
+	if (type(v) != 'array')
+		return null;
+
+	let s = (x) => (type(x) == 'string') ? x : null;
+
+	return map(filter(slice(v, 0, MAX_EIMS), (e) => type(e) == 'object'),
+		(e) => ({ id: s(e.id), fqdn: s(e.fqdn), tls: s(e.tls) }));
+}
+
 // The assistant's command line: ipad [options] <cmd> [file].
 //   -s  its state directory (emulation state per EID, the device key)
 //   -b  backend, -e eIM id, -k no TLS verification (lab only), -i IMEI,
@@ -261,6 +278,7 @@ return {
 	due: due,
 	build_cmd: build_cmd,
 	rplmn_of: rplmn_of,
+	eims_of: eims_of,
 	log_level: log_level,
 
 	// The scheduler proper, on typed options (cfg_of) and direct deps:
@@ -575,6 +593,10 @@ return {
 				// an emulated card's self-binding (D-69) and its counter
 				st.bind = rec.payload?.bind;
 				st.counter = rec.payload?.counter;
+				// what the card holds now; an event without the list (an
+				// older assistant) leaves the last one known
+				if (type(rec.payload?.eims) == 'array')
+					st.eims = eims_of(rec.payload.eims);
 				return reply({});
 			// the end of a poll or provision: what it did, and why it failed
 			case 'summary':
@@ -598,7 +620,7 @@ return {
 			reply({ online: false });
 		};
 
-		// job: null for a poll, { cmd: 'export'|'provision'|'info', file? }
+		// job: null for a poll, { cmd: 'export'|'provision'|'info'|'eim-save', file? }
 		// for a run of its own; job.result(st) is what its callback answers
 		let run = (ref, cfg, why, cb, job) => {
 			let entry = deps.modem_of(ref);
@@ -678,6 +700,10 @@ return {
 								return step('provision');
 							}
 
+							// eim-save on a card without an eIM: nothing to save
+							if (code == EXIT_NO_EIM && job?.cmd == 'eim-save')
+								return finish(ref, st, false, 'no_eim', cb);
+
 							if (rerr)
 								return finish(ref, st, false,
 									(code != null) ? sprintf('exit %d', code) : (rerr.error ?? 'error'), cb);
@@ -711,6 +737,7 @@ return {
 			bound: (st.backend == 'emulated') ? (st.bind == 'done') : null,
 			counter: st.counter,
 			key_fingerprint: st.key_fingerprint,
+			eims: st.eims,
 			last_poll: st.last_poll?.at,
 			last_ok: st.last_poll?.ok,
 			last_error: st.last_poll?.error,
@@ -786,9 +813,21 @@ return {
 			},
 
 			// the card as the assistant sees it now (`ipad info`): EID,
-			// backend, device key, binding and counter
+			// backend, device key, binding, counter and its eIMs
 			info: function(ref, cfg, cb) {
 				run(ref, cfg, 'info', cb, { cmd: 'info', result: info_of });
+			},
+
+			// The card's eIM configurations as it holds them (`ipad
+			// eim-save`, a GetEimConfigurationDataResponse, DER) into a
+			// file: to look at, or for `wwandctl ipa eim` on another card.
+			// A run of its own; no_eim when the card has none.
+			eim_save: function(ref, cfg, file, cb) {
+				if (!safe_path(file))
+					return cb({ error: 'invalid_argument', detail: 'file' });
+
+				run(ref, cfg, 'eim-save', cb, { cmd: 'eim-save', file: file,
+					result: (st) => ({ file: file, eims: st.eims }) });
 			},
 
 			// Forget what the emulation holds for this modem's card: its eIM
@@ -891,6 +930,9 @@ return {
 					// done or refused; and its counter for the eIM
 					bind: st.bind,
 					counter: st.counter,
+					// the eIM configurations on the card (id, fqdn, tls) as
+					// the last run read them; null before any run
+					eims: st.eims,
 					// the last poll's own account (the assistant's summary
 					// event): packages, acknowledged results, bind, error
 					last_poll: st.last_poll,
@@ -982,7 +1024,10 @@ return {
 				// modem_plugin { op: 'provision', args: { file } } -> the card's info
 				provision: (ref, ext, args, cb) =>
 					sch.provision(ref, cfg_of(ext, pd.modem_of(ref)), args?.file ?? '', cb),
-				// modem_plugin { op: 'info' } -> { eid, card_type, bound, counter, … }
+				// modem_plugin { op: 'eim_save', args: { file } } -> { file, eims }
+				eim_save: (ref, ext, args, cb) =>
+					sch.eim_save(ref, cfg_of(ext, pd.modem_of(ref)), args?.file ?? '', cb),
+				// modem_plugin { op: 'info' } -> { eid, card_type, bound, counter, eims, … }
 				info: (ref, ext, args, cb) => sch.info(ref, cfg_of(ext, pd.modem_of(ref)), cb),
 				// modem_plugin { op: 'reset', args: { all } } -> { reset: true, all }
 				reset: (ref, ext, args, cb) => sch.reset(ref, cfg_of(ext, pd.modem_of(ref)), cb, { all: !!args?.all }),

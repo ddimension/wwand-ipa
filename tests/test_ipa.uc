@@ -508,7 +508,7 @@ delete modem.slot_status;
 	s3.provision('m1', cfg, '/tmp/b.json', (e, r) => { pres = [ e, r ]; });
 	ok(index(runs[0] ?? '', " provision '/tmp/b.json'") >= 0, 'bundle: ipad provision with the file');
 	eq(pres, [ null, { eid: EID, card_type: 'emulated', bind: 'pending', bound: false, counter: 0, key_fingerprint: 'AB12',
-	                   last_poll: null, last_ok: null, last_error: null, file: '/tmp/b.json' } ],
+	                   eims: null, last_poll: null, last_ok: null, last_error: null, file: '/tmp/b.json' } ],
 		'bundle: provision answers the card, binding pending');
 	eq([ s3.status('m1', cfg).runs, s3.status('m1', cfg).last_end ], [ before.runs, before.last_end ],
 		'bundle: a provision is no poll: the schedule does not move');
@@ -574,6 +574,77 @@ delete modem.slot_status;
 	rr = null;
 	s3.reset('m2', cfg, (e, r) => { rr = [ e, r ]; }, { all: true });
 	eq(rr[0]?.error, 'busy', 'bundle: no reset --all while any modem runs');
+	script = null;
+}
+
+// --- the card's eIM configurations: the info event, status, eim-save ---------
+
+eq(ipa.eims_of(null), null, 'eims_of: not said is null, not []');
+eq(ipa.eims_of([]), [], 'eims_of: none');
+eq(ipa.eims_of([ { id: 'e1', fqdn: 'eim.example', tls: 'key', extra: 'x' }, 'junk', { id: 5, fqdn: 'f' } ]),
+	[ { id: 'e1', fqdn: 'eim.example', tls: 'key' }, { id: null, fqdn: 'f', tls: null } ],
+	'eims_of: strings only, the known fields only, no non-objects');
+eq(length(ipa.eims_of(map([ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ], (i) => ({ id: 'e' + i })))), 8,
+	'eims_of: no more than a card holds');
+
+{
+	let s4 = mk();
+	let ev = (evs, code) => (on_ipa, on_done) => {
+		let i = 0, next;
+
+		next = () => (i < length(evs))
+			? on_ipa({ kind: 'event', event: evs[i][0], payload: evs[i++][1] }, next)
+			: on_done(code ? { error: 'lpac', code: code } : null, '');
+		next();
+		return null;
+	};
+	let E1 = [ { id: 'eim.example', fqdn: 'eim.example:443', tls: 'certificate' } ];
+
+	online = 'wan:51';
+	eq(s4.status('m1', cfg).eims, null, 'eims: unknown before any run');
+
+	// info: the list in the answer and in status
+	script = ev([ [ 'info', { eid: EID, backend: 'iot', eims: E1 } ] ]);
+	let ires = null;
+	s4.info('m1', cfg, (e, r) => { ires = [ e, r ]; });
+	eq(ires[1]?.eims, E1, 'eims: info answers them');
+	eq(s4.status('m1', cfg).eims, E1, 'eims: status has them');
+
+	// an event without the list (an older assistant) keeps the last known
+	script = ev([ [ 'info', { eid: EID, backend: 'iot' } ] ]);
+	s4.info('m1', cfg, () => null);
+	eq(s4.status('m1', cfg).eims, E1, 'eims: an event without the list keeps the last one');
+
+	// a poll's start event updates them: the eIM changed the card (updateEim)
+	let E2 = [ { id: 'eim.example', fqdn: 'eim2.example', tls: 'key' } ];
+	script = ev([ [ 'info', { eid: EID, backend: 'iot', eims: E2 } ], [ 'summary', { command: 'poll', code: 0 } ] ]);
+	s4.poll('m1', cfg, () => null);
+	eq(s4.status('m1', cfg).eims, E2, 'eims: a poll\'s info event updates them');
+
+	// eim-save: its own run with the file, answers the file and the list
+	runs = [];
+	let sres = null;
+	script = ev([ [ 'info', { eid: EID, backend: 'iot', eims: E2 } ] ]);
+	s4.eim_save('m1', cfg, '/tmp/wwand/card-eim.ber', (e, r) => { sres = [ e, r ]; });
+	ok(index(runs[0] ?? '', " eim-save '/tmp/wwand/card-eim.ber' 2>&1") >= 0, 'eim-save: ipad eim-save with the file');
+	eq(sres, [ null, { file: '/tmp/wwand/card-eim.ber', eims: E2 } ], 'eim-save: answers the file and the eIMs');
+
+	// no eIM on the card (ipad exit 3): no_eim, and NOT the provisioning
+	// a poll does with ipa_eim_config
+	runs = [];
+	script = ev([ [ 'info', { eid: EID, backend: 'iot', eims: [] } ] ], 3);
+	s4.eim_save('m1', cfg, '/tmp/wwand/card-eim.ber', (e, r) => { sres = [ e, r ]; });
+	eq(sres[0]?.detail, 'no_eim', 'eim-save, no eIM: no_eim');
+	eq(length(runs), 1, 'eim-save, no eIM: nothing provisioned');
+	eq(s4.status('m1', cfg).eims, [], 'eims: none on the card now');
+
+	s4.eim_save('m1', cfg, "/tmp/x'; reboot", (e, r) => { sres = [ e, r ]; });
+	eq(sres[0]?.error, 'invalid_argument', 'eim-save: a path with shell characters is refused');
+
+	let before = s4.status('m1', cfg).runs;
+	script = ev([ [ 'info', { eid: EID, backend: 'iot', eims: E2 } ] ]);
+	s4.eim_save('m1', cfg, '/tmp/wwand/card-eim.ber', () => null);
+	eq(s4.status('m1', cfg).runs, before, 'eim-save is no poll');
 	script = null;
 }
 

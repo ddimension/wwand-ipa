@@ -55,6 +55,16 @@ eq(fmt.rows({ enabled: true, now: 0, state: 'idle', eid: 'E2', backend: 'iot',
 	[ 'Card', 'EID E2 · IoT eUICC' ],
 	[ 'Connectivity', '8949: APN iot.ex · ipv4 → left to your wwand_sim mysim' ],
 ], 'an IoT eUICC, and a hand-written wwand_sim that wins');
+eq(fmt.rows({ enabled: true, now: 0, state: 'idle', eid: 'E2', backend: 'iot',
+              eims: [ { id: 'eim.ex', fqdn: 'eim.ex:443', tls: 'key' }, { id: 'eim.b', fqdn: null, tls: 'odd' } ] }).slice(2), [
+	[ 'Card', 'EID E2 · IoT eUICC' ],
+	[ 'eIM config', 'eim.ex · eim.ex:443 · TLS: pinned key' ],
+	[ 'eIM config', 'eim.b · no FQDN (not polled) · TLS: odd' ],
+], 'the eIM configurations on the card, the same text as wwandctl ipa');
+eq(fmt.rows({ enabled: true, now: 0, state: 'idle', eims: [] }).slice(2),
+   [ [ 'eIM config', 'none on the card' ] ], 'a card without an eIM says so');
+eq(fmt.rows({ enabled: true, now: 0, state: 'idle', eims: null }).filter((r) => r[0] == 'eIM config'), [],
+   'nothing about the eIMs before a run read them');
 eq(fmt.rows({ enabled: true, now: 0, state: 'idle', last_changes: { downloads: [ { ok: true }, { ok: false } ] } }).pop(),
    [ 'Last changes', 'downloaded · download failed' ], 'downloads the eIM asked for');
 

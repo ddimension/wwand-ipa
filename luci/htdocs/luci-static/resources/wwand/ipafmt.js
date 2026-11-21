@@ -52,6 +52,25 @@ return baseclass.extend({
 			rows.push([ _('Card'), 'EID ' + st.eid + how ]);
 		}
 
+		/* the eIM configurations on the card as the last run read them; the
+		   same text as `wwandctl ipa` */
+		if (Array.isArray(st.eims)) {
+			var tls = { key: _('TLS: pinned key'), certificate: _('TLS: pinned certificate'),
+			            configuration: _('TLS: from the configuration'), system: _('TLS: system CAs') };
+
+			if (!st.eims.length)
+				rows.push([ _('eIM config'), _('none on the card') ]);
+
+			st.eims.forEach(function(e) {
+				var parts = [ (e && e.id) || _('(no id)'), (e && e.fqdn) || _('no FQDN (not polled)') ];
+
+				if (e && e.tls)
+					parts.push(tls[e.tls] || 'TLS: ' + e.tls);
+
+				rows.push([ _('eIM config'), parts.join(' · ') ]);
+			});
+		}
+
 		/* where the enabled profile's APN came from and where it went: the
 		   same text as `wwandctl ipa` */
 		var cn = st.connectivity;

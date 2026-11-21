@@ -14,6 +14,7 @@ let ctl = require('wwand.ctl.ipa');
 	let st = { enabled: true, state: 'idle', runs: 4, profile_changes: 1,
 	           last_end: 1000, last_ok: false, last_error: 'exit 234', fails: 2,
 	           next_due: 1000 + 1200, eid: 'E1', backend: 'emulated', key_fingerprint: '0123456789ABCDEF0123',
+	           eims: [ { id: 'eim.ex', fqdn: 'eim.ex:443', tls: 'certificate' }, { id: 'eim.b', tls: 'system' } ],
 	           connectivity: { iccid: '8949', source: 'emulated: none', section: 'wwsim_8949', written: true },
 	           last_changes: { switched: [ { from: 'A', to: 'B', rollback: false },
 	                                       { from: 'B', to: 'A', rollback: true } ],
@@ -24,12 +25,18 @@ let ctl = require('wwand.ctl.ipa');
 		[ 'last run', '5 min ago · failed: exit 234 (2 in a row)' ],
 		[ 'next poll', 'in 15 min' ],
 		[ 'card', 'EID E1 · SGP.22 card, emulated · device key 0123456789ABCDEF…' ],
+		[ 'eIM config', 'eim.ex · eim.ex:443 · TLS: pinned certificate' ],
+		[ 'eIM config', 'eim.b · no FQDN (not polled) · TLS: system CAs' ],
 		[ 'connectivity', '8949: none stated (emulated: none) → wwsim_8949 (written)' ],
 		[ 'last changes', 'switched A → B · rolled back B → A · installed C' ],
 	], 'ipa: outcome first, then when it tries again, the card and what the last run did');
 
 	eq(ctl.ipa_lines({ enabled: true, state: 'idle', runs: 0, profile_changes: 0 }, 0)[1],
 	   [ 'next poll', 'once the connection is up' ], 'ipa: offline, the next poll waits for the connection');
+	eq(filter(ctl.ipa_lines({ ...st, eims: [] }, 1300), (l) => l[0] == 'eIM config'),
+	   [ [ 'eIM config', 'none on the card' ] ], 'ipa: a card without an eIM says so');
+	eq(filter(ctl.ipa_lines({ ...st, eims: null }, 1300), (l) => l[0] == 'eIM config'), [],
+	   'ipa: nothing about the eIMs before a run read them');
 	eq(ctl.ipa_lines({ ...st, next_due: 1000 }, 1300)[2], [ 'next poll', 'due now' ], 'ipa: an overdue poll is due now');
 	eq(ctl.ipa_lines({ ...st, last_ok: true, fails: 0, last_end: 0 }, 3 * 3600 + 5 * 60)[1],
 	   [ 'last run', '3 h 5 min ago · ok' ], 'ipa: a good run, hours ago');
@@ -56,7 +63,7 @@ eq(ctl.eim_config_kind('\x30\x0a\x02\x01\x00'), null, 'eim file: some other SEQU
 }
 
 
-ok(type(ctl.run) == 'function' && length(ctl.help) == 9, 'ctl: the shape wwandctl loads (run, help)');
+ok(type(ctl.run) == 'function' && length(ctl.help) == 10, 'ctl: the shape wwandctl loads (run, help)');
 
 // --- provision / poll / info / reset: the scripted commands --------------------
 // A fake daemon (ctx.call answers per op from a script) and a fake system
@@ -114,7 +121,7 @@ const INFO = { eid: 'E1', card_type: 'emulated', bind: 'pending', bound: false, 
 	eq(ctl.provision(e.ctx, 'm1', [ '/tmp/b.json' ], e.sys), 0, 'provision: exit 0');
 	eq(e.calls[0], [ 'modem_plugin', 'provision', { file: '/tmp/b.json' } ], 'provision: the plugin op with the file');
 	eq(e.json(), { result: 'ok', eid: 'E1', card_type: 'emulated', bound: false, bind: 'pending', counter: 0,
-	               key_fingerprint: 'AB12', last_poll: null, last_error: null, bundle_deleted: true },
+	               key_fingerprint: 'AB12', eims: null, last_poll: null, last_error: null, bundle_deleted: true },
 	   'provision: the JSON line: the card, binding pending, the bundle gone');
 	eq(e.uci.m1.ipa, '1', 'provision: fleet management switched on');
 	ok(e.commits == 1 && e.calls[1][0] == 'reload', 'provision: committed and reloaded');
@@ -217,7 +224,26 @@ const INFO = { eid: 'E1', card_type: 'emulated', bind: 'pending', bound: false, 
 	let e = mkenv({ info: { ok: true, ...INFO, bind: 'done', bound: true, counter: 3, last_poll: 1234, last_error: null } });
 	eq(ctl.info(e.ctx, 'm1', e.sys), 0, 'info: exit 0');
 	eq(e.json(), { eid: 'E1', card_type: 'emulated', bound: true, bind: 'done', counter: 3, key_fingerprint: 'AB12',
-	               last_poll: 1234, last_error: null }, 'info: the fields the lab driver reads');
+	               eims: null, last_poll: 1234, last_error: null }, 'info: the fields the lab driver reads');
+	e = mkenv({ info: { ok: true, ...INFO, eims: [ { id: 'eim.ex', fqdn: 'eim.ex:443', tls: 'key' } ] } });
+	ctl.info(e.ctx, 'm1', e.sys);
+	eq(e.json().eims, [ { id: 'eim.ex', fqdn: 'eim.ex:443', tls: 'key' } ], 'info: the card\'s eIMs');
+
+	// eim-save: the plugin op with the absolute path, the file and the eIMs
+	e = mkenv({ eim_save: { ok: true, file: '/tmp/c.ber', eims: [ { id: 'eim.ex' } ] } });
+	eq(ctl.eim_save(e.ctx, 'm1', [ '/tmp/c.ber' ], e.sys), 0, 'eim-save: exit 0');
+	eq(e.calls[0], [ 'modem_plugin', 'eim_save', { file: '/tmp/c.ber' } ], 'eim-save: the plugin op with the file');
+	eq(e.json(), { result: 'ok', file: '/tmp/c.ber', eims: [ { id: 'eim.ex' } ] }, 'eim-save: the JSON line');
+	ok(index(join('', e.err), 'eim /tmp/c.ber') >= 0, 'eim-save: says how to use it on another card');
+	e = mkenv({});
+	ctl.eim_save(e.ctx, 'm1', [ 'c.ber' ], e.sys);
+	ok(substr(e.calls[0][2].file, 0, 1) == '/' && substr(e.calls[0][2].file, -6) == '/c.ber', 'eim-save: a relative path made absolute');
+	e = mkenv({ eim_save: { ok: false, error: 'ipa', detail: 'no_eim' } });
+	eq(ctl.eim_save(e.ctx, 'm1', [ '/tmp/c.ber' ], e.sys), 1, 'eim-save, no eIM: exit 1');
+	eq(e.json(), { result: 'error', error: 'the card holds no eIM configuration' }, 'eim-save, no eIM: said so');
+	e = mkenv({});
+	eq(ctl.eim_save(e.ctx, 'm1', [], e.sys), 1, 'eim-save: no file is a usage error');
+	eq(length(e.calls), 0, 'eim-save: ...and asks nothing');
 
 	e = mkenv({ reset: { ok: true, reset: true } });
 	e.uci.m1.ipa = '1';

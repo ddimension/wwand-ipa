@@ -159,6 +159,18 @@ a card only when the card has no eIM yet: ipad says so on its first poll,
 and wwand then provisions it. A card that has an eIM keeps it. Moving a card
 to another eIM is the eIM's business (SGP.32 `addEim` / `updateEim`).
 
+**An IoT eUICC that already has an eIM** (from the factory, or provisioned
+elsewhere) needs no file: `option ipa '1'` is enough. ipad reads the eIM
+configuration from the card (ES10b `GetEimConfigurationData`) at every run;
+`wwandctl ipa` and LuCI show it (`eIM config`). `wwandctl ipa [modem]
+eim-save <file>` writes it as the card holds it (a
+`GetEimConfigurationDataResponse`, `BF55`), which `eim <file>` takes on
+another card: that card asks for an associationToken of its own, picks its
+own CI key, and starts at counter 0, since a card never reveals its counter.
+A card that leaves the eIM's key out of its answer (SGP.32 allows it) gives a
+file no card takes: the poll that provisions it fails, and `wwandctl ipa`
+shows why (`the card did not return its key`).
+
 ## Options
 
 | Option | Default | |
@@ -210,10 +222,11 @@ wwandctl ipa [modem] eim <file>         # set the eIM, enable
 wwandctl ipa [modem] export <file>      # the eIM import file (emulated card)
 wwandctl ipa [modem] provision <bundle> # store a bundle, enable (JSON)
 wwandctl ipa [modem] info               # the card now (JSON)
+wwandctl ipa [modem] eim-save <file>    # the card's eIM configuration as it holds it (JSON)
 wwandctl ipa [modem] reset [--all]      # forget this card's state; --all: every card, key, binding (JSON)
 ```
 
-`provision`, `poll`, `info` and `reset` are for scripts too (the eIM lab's
+`provision`, `poll`, `info`, `eim-save` and `reset` are for scripts too (the eIM lab's
 target driver, a bulk station): the last line on stdout is one JSON object,
 messages for people go to stderr, and the exit status is
 
@@ -229,9 +242,14 @@ messages for people go to stderr, and the exit status is
   `{"result":"ok"|"error","packages":n,"results":n,"notifications":n,"bound":bool,"bind":"…","eid":"…","error":"…"}`.
   `results` counts the results the eIM acknowledged.
 - `info` reads the card (a short session of its own):
-  `{"eid","card_type":"iot"|"emulated","bound","bind","counter","key_fingerprint","last_poll","last_error"}`.
+  `{"eid","card_type":"iot"|"emulated","bound","bind","counter","key_fingerprint","eims","last_poll","last_error"}`.
   `bind` is `none`, `pending`, `done` or `refused`; `bound` is null for an
-  IoT eUICC, which does not bind. `last_poll` is the time of the last poll.
+  IoT eUICC, which does not bind. `eims` lists the card's eIM configurations,
+  `[{"id","fqdn","tls":"key"|"certificate"|"configuration"|"system"}]`
+  (`[]`: none). `last_poll` is the time of the last poll.
+- `eim-save <file>` writes the card's `GetEimConfigurationDataResponse`
+  (DER, 0600) and answers `{"result":"ok","file","eims"}`; a card without an
+  eIM fails with `the card holds no eIM configuration`.
 - `provision` answers like `info`, plus `bundle_deleted`, or with
   `bundle_kept` when the bundle could not be stored.
 - `reset` removes the eIM configuration and state the emulation holds for
@@ -255,9 +273,11 @@ messages for people go to stderr, and the exit status is
 - `export { file }`: answers `{ file }` when the file is written;
 - `provision { file }`: answers the card's info once the bundle is stored;
 - `info`: the card's info, read in a session of its own;
+- `eim_save { file }`: `{ file, eims }` when the file is written (error
+  detail `no_eim`: the card has none);
 - `reset { all }`: `{ reset: true, all }`.
 
-Only a poll moves the schedule; `export`, `provision` and `info` do not count
+Only a poll moves the schedule; `export`, `provision`, `info` and `eim_save` do not count
 as runs.
 
 The read-only `modem_plugin_status` reaches `status` only.
@@ -270,6 +290,7 @@ The read-only `modem_plugin_status` reaches `status` only.
 | `eid`, `backend` | `iot` / `emulated` |
 | `key_fingerprint` | SHA-256 of the device key |
 | `bind`, `counter` | an emulated card's self-binding (`none` / `pending` / `done` / `refused`) and its counter for the eIM |
+| `eims` | the card's eIM configurations as the last run read them: `[{ id, fqdn, tls }]`; null before any run |
 | `last_poll` | `{ at, ok, error, summary }`: the last poll, with ipad's own account of it (packages, acknowledged results, exit code) |
 | `runs`, `profile_changes` | counters |
 | `last_start`, `last_end`, `last_ok`, `last_error` | the last run. Errors: ipad's own reason, or `no_eim_config`, `eim_config_missing`, `busy`, `exit <n>`, … |
