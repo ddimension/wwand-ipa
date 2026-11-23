@@ -13,6 +13,28 @@ function dur(s) {
 }
 
 return baseclass.extend({
+	/* Which IPA serves the card, from the daemon's eUICC probe (wwand status,
+	   modems.<m>.euicc: { sgp32, ipae_supported, ipa }). [ text, warn ]: warn
+	   is true when fleet management cannot work as configured — a card whose
+	   own IPA (IPAe) runs refuses every ES10 command from the router. null:
+	   no eUICC seen (yet). */
+	ipa: function(euicc, enabled) {
+		if (!euicc)
+			return null;
+
+		if (euicc.ipa == 'ipad')
+			return [ euicc.ipae_supported ? _('router (IPAd) — the card\'s own IPA is off')
+			                              : _('router (IPAd)'), false ];
+
+		if (euicc.ipa == 'ipae')
+			return [ _('the card\'s own IPA (IPAe) — the router has no access to the card. Set "SGP.32 IPA" to "Router (IPAd)" below to manage it from here.'), !!enabled ];
+
+		if (euicc.sgp32 === false)
+			return [ _('router — an SGP.22 card, whose SGP.32 functions the router emulates'), false ];
+
+		return [ _('router'), false ];
+	},
+
 	/* The plugin's status (modem_plugin_status, plugin 'ipa') as [ label, text ]
 	   rows. Its timestamps are on the DAEMON's clock and st.now is that clock,
 	   so "ago" and "in" never mix it with the browser's. Outcome first, then
@@ -34,6 +56,9 @@ return baseclass.extend({
 				st.last_ok ? _('ok')
 				           : _('failed: %s').format(st.last_error || '?') +
 				             (n(st.fails) > 1 ? ' ' + _('(%d in a row)').format(n(st.fails)) : '')) ]);
+
+		if (st.interval != null)
+			rows.push([ _('Interval'), dur(n(st.interval)) ]);
 
 		if (st.next_due != null && now != null)
 			rows.push([ _('Next poll'), st.next_due > now ? _('in %s').format(dur(st.next_due - now)) : _('due now') ]);

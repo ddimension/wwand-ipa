@@ -183,6 +183,12 @@ shows why (`the card did not return its key`).
 | `ipa_direct` | on | offer direct downloads (lpac) to the eIM |
 | `ipa_insecure` | off | no TLS verification of the eIM — lab only |
 
+All of them, and the card-side `ipa_mode` (wwand: `ipad` switches an IoT
+eUICC's own IPA off, which fleet management on such a card needs), can be set
+on **LuCI → Network → eSIM Fleet**, below each modem's status. Saving reloads
+wwand through its trigger on `/etc/config/network`; the modem is not
+restarted.
+
 The eIM's TLS identity comes from its configuration
 (`trustedPublicKeyDataTls`: a pinned key, its certificate or its CA), and
 otherwise from the system CAs.

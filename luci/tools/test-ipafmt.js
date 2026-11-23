@@ -68,5 +68,14 @@ eq(fmt.rows({ enabled: true, now: 0, state: 'idle', eims: null }).filter((r) => 
 eq(fmt.rows({ enabled: true, now: 0, state: 'idle', last_changes: { downloads: [ { ok: true }, { ok: false } ] } }).pop(),
    [ 'Last changes', 'downloaded · download failed' ], 'downloads the eIM asked for');
 
+eq(fmt.rows({ enabled: true, now: 0, state: 'idle', interval: 300 }).filter((r) => r[0] == 'Interval'),
+   [ [ 'Interval', '5m 0s' ] ], 'the poll interval the plugin runs with');
+eq(fmt.ipa(null, true), null, 'no eUICC seen: no IPA row');
+eq(fmt.ipa({ sgp32: true, ipae_supported: true, ipa: 'ipad' }, true), [ 'router (IPAd) — the card\'s own IPA is off', false ], 'IPAd on a card with an IPAe: that one is off');
+eq(fmt.ipa({ sgp32: true, ipae_supported: false, ipa: 'ipad' }, true), [ 'router (IPAd)', false ], 'IPAd on a card without an IPAe: nothing switched off');
+eq(fmt.ipa({ sgp32: true, ipa: 'ipae' }, true)[1], true, 'IPAe with fleet management on: flagged, it cannot work');
+eq(fmt.ipa({ sgp32: true, ipa: 'ipae' }, false)[1], false, 'IPAe with fleet management off: only said');
+eq(/emulates/.test(fmt.ipa({ sgp32: false, ipa: null }, true)[0]), true, 'an SGP.22 card: emulated by the router');
+
 console.log(`test-ipafmt: ${checks} checks, ${failures} failures`);
 process.exit(failures ? 1 : 0);

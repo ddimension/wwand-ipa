@@ -315,8 +315,15 @@ last changes switched 8949…01 → 8949…02
 ```
 
 **LuCI → Network → eSIM Fleet** shows the same per modem, including the
-downloads of the last run, and has a *Poll now* button. The page reads
-through `modem_plugin_status` and polls through `modem_plugin`.
+downloads of the last run, and has a *Poll now* button. It also shows which
+IPA serves the card (from wwand's eUICC probe; in red when fleet management is
+on but the card's own IPA (IPAe) still runs, since that card refuses the
+router) and the poll interval. Below the status it sets the plugin's options
+and `ipa_mode` on the modem's `wwand_modem` section. The page reads through
+`modem_plugin_status`, polls through `modem_plugin` and writes the network
+config through uci (ACL `luci-app-wwand-ipa`).
+
+![eSIM Fleet: status and options of an IoT eUICC served by the router's IPA](images/luci-ipa.png)
 
 **`ubus call wwand modem_plugin_status '{"modem":"m0","plugin":"ipa","op":"status"}'`**
 returns the full record: `state` (`idle`, `running`, `waiting_online`,

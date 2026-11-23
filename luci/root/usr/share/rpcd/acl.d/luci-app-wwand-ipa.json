@@ -1,20 +1,26 @@
 {
 	"luci-app-wwand-ipa": {
-		"description": "Grant access to the wwand eSIM fleet management (eIM) page",
+		"description": "Grant access to the wwand eSIM fleet management (eIM) page and its options in the network config",
 		"read": {
 			"ubus": {
 				"wwand": [
 					"status",
 					"modem_plugin_status"
 				]
-			}
+			},
+			"uci": [
+				"network"
+			]
 		},
 		"write": {
 			"ubus": {
 				"wwand": [
 					"modem_plugin"
 				]
-			}
+			},
+			"uci": [
+				"network"
+			]
 		}
 	}
 }
